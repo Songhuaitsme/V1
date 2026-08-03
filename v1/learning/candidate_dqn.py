@@ -1,6 +1,7 @@
 """Variable-cardinality shared candidate Q-network and Double-DQN update."""
 
 from dataclasses import dataclass
+from collections import OrderedDict
 import hashlib
 import json
 import random
@@ -53,6 +54,24 @@ class SharedCandidateQNetwork(nn.Module):
             -1, candidate_embedding.shape[1], -1
         )
         return self.q_head(torch.cat((expanded_global, candidate_embedding), dim=-1)).squeeze(-1)
+
+    def forward_ragged(
+        self, global_state, candidate_features, candidate_batch_index
+    ):
+        """Score flattened variable-size candidate sets in one network call."""
+        if global_state.ndim != 2 or candidate_features.ndim != 2:
+            raise ValueError("ragged inputs must be two-dimensional")
+        indices = candidate_batch_index.to(
+            device=global_state.device, dtype=torch.long
+        )
+        if indices.ndim != 1 or len(indices) != len(candidate_features):
+            raise ValueError("ragged candidate indices are not aligned")
+        global_embedding = self.global_encoder(global_state)
+        candidate_embedding = self.candidate_encoder(candidate_features)
+        expanded_global = global_embedding.index_select(0, indices)
+        return self.q_head(
+            torch.cat((expanded_global, candidate_embedding), dim=-1)
+        ).squeeze(-1)
 
 
 def mask_q_values(q_values: np.ndarray, valid_mask: Optional[Sequence[bool]]) -> np.ndarray:
@@ -706,6 +725,7 @@ class CandidateDQNTrainer:
         *,
         device="cpu",
         candidate_chunk_size=4096,
+        bootstrap_candidate_limit=None,
         next_candidate_provider: Optional[Callable[[object], Iterable]] = None,
     ):
         if (
@@ -720,12 +740,42 @@ class CandidateDQNTrainer:
         self.online = online.to(self.device)
         self.target = target.to(self.device)
         self.candidate_chunk_size = candidate_chunk_size
+        if bootstrap_candidate_limit is not None and (
+            isinstance(bootstrap_candidate_limit, bool)
+            or not isinstance(bootstrap_candidate_limit, int)
+            or bootstrap_candidate_limit <= 0
+        ):
+            raise ValueError(
+                "bootstrap_candidate_limit must be None or a positive integer"
+            )
+        self.bootstrap_candidate_limit = bootstrap_candidate_limit
         self.next_candidate_provider = next_candidate_provider
         self.optimizer = torch.optim.Adam(
             self.online.parameters(), lr=positive_finite("learning_rate", learning_rate)
         )
         self.loss_fn = nn.SmoothL1Loss()
         self.profiler = None
+        self._next_feature_cache = OrderedDict()
+        self._next_feature_cache_capacity = 5000
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_next_feature_cache"] = OrderedDict()
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if "_next_feature_cache" not in self.__dict__:
+            self._next_feature_cache = OrderedDict()
+        if "_next_feature_cache_capacity" not in self.__dict__:
+            self._next_feature_cache_capacity = 5000
+
+    def clear_next_feature_cache(self):
+        if not hasattr(self, "_next_feature_cache"):
+            self._next_feature_cache = OrderedDict()
+        if not hasattr(self, "_next_feature_cache_capacity"):
+            self._next_feature_cache_capacity = 5000
+        self._next_feature_cache.clear()
 
     def _synchronize_profile_device(self):
         if self.profiler is not None and self.device.type == "cuda":
@@ -737,15 +787,137 @@ class CandidateDQNTrainer:
     def train_transition(self, transition: ReplayTransition) -> float:
         return self.train_batch((transition,))
 
-    def _feature_chunks(self, transition):
-        if transition.next_candidate_context is not None:
+    def _feature_matrix(self, transition):
+        if not hasattr(self, "_next_feature_cache"):
+            self.clear_next_feature_cache()
+        context = transition.next_candidate_context
+        if context is not None:
             if self.next_candidate_provider is None:
                 raise ValueError("context-backed replay requires next_candidate_provider")
-            yield from self.next_candidate_provider(transition.next_candidate_context)
-            return
-        features = transition.next_candidate_features
+            key = id(context)
+            cached = self._next_feature_cache.get(key)
+            if cached is not None and cached[0] is context:
+                self._next_feature_cache.move_to_end(key)
+                return cached[1]
+            chunks = []
+            count = 0
+            for raw_chunk in self.next_candidate_provider(context):
+                chunk = np.asarray(raw_chunk, dtype=np.float32)
+                if self.bootstrap_candidate_limit is not None:
+                    remaining = self.bootstrap_candidate_limit - count
+                    if remaining <= 0:
+                        break
+                    chunk = chunk[:remaining]
+                if len(chunk):
+                    chunks.append(chunk)
+                    count += len(chunk)
+                if (
+                    self.bootstrap_candidate_limit is not None
+                    and count >= self.bootstrap_candidate_limit
+                ):
+                    break
+            matrix = (
+                np.concatenate(chunks, axis=0)
+                if chunks
+                else np.empty(
+                    (0, self.online.candidate_feature_dim), dtype=np.float32
+                )
+            )
+            self._next_feature_cache[key] = (context, matrix)
+            self._next_feature_cache.move_to_end(key)
+            while len(self._next_feature_cache) > self._next_feature_cache_capacity:
+                self._next_feature_cache.popitem(last=False)
+            return matrix
+        matrix = np.asarray(transition.next_candidate_features, dtype=np.float32)
+        if matrix.size == 0:
+            return np.empty(
+                (0, self.online.candidate_feature_dim), dtype=np.float32
+            )
+        matrix = matrix.reshape((-1, self.online.candidate_feature_dim))
+        if self.bootstrap_candidate_limit is not None:
+            matrix = matrix[:self.bootstrap_candidate_limit]
+        return matrix
+
+    def _feature_chunks(self, transition):
+        features = self._feature_matrix(transition)
         for start in range(0, len(features), self.candidate_chunk_size):
             yield features[start:start + self.candidate_chunk_size]
+
+    def _double_dqn_bootstrap_batch(self, batch):
+        matrices = []
+        states = []
+        positions = []
+        counts = []
+        for position, transition in enumerate(batch):
+            if transition.terminal:
+                continue
+            generation_started = time.perf_counter()
+            matrix = self._feature_matrix(transition)
+            if self.profiler is not None:
+                self.profiler.add(
+                    "replay_candidate_generation_seconds",
+                    time.perf_counter() - generation_started,
+                )
+                self.profiler.increment(
+                    "replay_candidate_feature_count", len(matrix)
+                )
+            if len(matrix) == 0:
+                continue
+            matrices.append(matrix)
+            states.append(transition.global_state_after)
+            positions.append(position)
+            counts.append(len(matrix))
+
+        target_values = torch.tensor(
+            [item.reward for item in batch],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if not matrices:
+            return target_values
+        next_states = torch.as_tensor(
+            np.asarray(states, dtype=np.float32), device=self.device
+        )
+        candidate_features = torch.as_tensor(
+            np.concatenate(matrices, axis=0), device=self.device
+        )
+        batch_indices = torch.repeat_interleave(
+            torch.arange(len(counts), device=self.device),
+            torch.tensor(counts, device=self.device),
+        )
+        self._synchronize_profile_device()
+        inference_started = time.perf_counter()
+        with torch.no_grad():
+            online_values = self.online.forward_ragged(
+                next_states, candidate_features, batch_indices
+            )
+            target_candidates = self.target.forward_ragged(
+                next_states, candidate_features, batch_indices
+            )
+            best_indices = []
+            offset = 0
+            for count in counts:
+                best_indices.append(
+                    offset + torch.argmax(online_values[offset:offset + count])
+                )
+                offset += count
+            bootstrap = target_candidates[torch.stack(best_indices)]
+            position_tensor = torch.tensor(
+                positions, dtype=torch.long, device=self.device
+            )
+            gamma_tensor = torch.tensor(
+                [batch[index].gamma_elapsed for index in positions],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            target_values[position_tensor] += gamma_tensor * bootstrap
+        self._synchronize_profile_device()
+        if self.profiler is not None:
+            self.profiler.add(
+                "bootstrap_inference_seconds",
+                time.perf_counter() - inference_started,
+            )
+        return target_values
 
     def _double_dqn_bootstrap(self, transition):
         if transition.terminal:
@@ -757,9 +929,12 @@ class CandidateDQNTrainer:
         )
         best_online = None
         best_target = None
+        remaining = self.bootstrap_candidate_limit
         with torch.no_grad():
             chunk_iterator = iter(self._feature_chunks(transition))
             while True:
+                if remaining is not None and remaining <= 0:
+                    break
                 generation_started = time.perf_counter()
                 try:
                     raw_chunk = next(chunk_iterator)
@@ -775,11 +950,14 @@ class CandidateDQNTrainer:
                         "replay_candidate_generation_seconds",
                         time.perf_counter() - generation_started,
                     )
+                if len(raw_chunk) == 0:
+                    continue
+                if remaining is not None and len(raw_chunk) > remaining:
+                    raw_chunk = raw_chunk[:remaining]
+                if self.profiler is not None:
                     self.profiler.increment(
                         "replay_candidate_feature_count", len(raw_chunk)
                     )
-                if len(raw_chunk) == 0:
-                    continue
                 chunk = torch.as_tensor(
                     np.asarray(raw_chunk, dtype=np.float32),
                     dtype=torch.float32,
@@ -800,6 +978,8 @@ class CandidateDQNTrainer:
                 if best_online is None or value > best_online:
                     best_online = value
                     best_target = float(target_values[index].item())
+                if remaining is not None:
+                    remaining -= len(raw_chunk)
         return best_target
 
     def train_batch(self, transitions: Sequence[ReplayTransition]) -> float:
@@ -827,19 +1007,7 @@ class CandidateDQNTrainer:
                 "training_forward_seconds",
                 time.perf_counter() - forward_started,
             )
-        target_values = []
-        for transition in batch:
-            bootstrap = self._double_dqn_bootstrap(transition)
-            target_values.append(
-                transition.reward
-                if bootstrap is None
-                else transition.reward + transition.gamma_elapsed * bootstrap
-            )
-        target_tensor = torch.tensor(
-            target_values,
-            dtype=torch.float32,
-            device=self.device,
-        )
+        target_tensor = self._double_dqn_bootstrap_batch(batch)
         loss = self.loss_fn(predicted, target_tensor)
         self._synchronize_profile_device()
         backward_started = time.perf_counter()

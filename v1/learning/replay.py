@@ -53,7 +53,12 @@ class ReplayTransition:
             raise ValueError(
                 "context-backed replay transitions use checkpoint serialization, not JSON"
             )
-        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"), allow_nan=False)
+        values = asdict(self)
+        values["next_candidate_features"] = [
+            [float(value) for value in row]
+            for row in self.next_candidate_features
+        ]
+        return json.dumps(values, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
     @classmethod
     def from_json(cls, payload: str) -> "ReplayTransition":

@@ -153,6 +153,12 @@ def create_v1_runtime(
         transmission,
         calendar,
         config.V1_TIME_TOLERANCE,
+        candidate_mode=config.V1_CANDIDATE_MODE,
+        pool_max_by_sla=config.V1_CANDIDATE_POOL_MAX_BY_SLA,
+        pool_node_limit_by_sla=config.V1_CANDIDATE_POOL_NODE_LIMIT_BY_SLA,
+        pool_time_samples_by_sla=(
+            config.V1_CANDIDATE_POOL_TIME_SAMPLES_BY_SLA
+        ),
     )
     forecast_end = (
         positive_finite("forecast_end_sim", forecast_end_sim)

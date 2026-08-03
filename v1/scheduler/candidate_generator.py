@@ -7,9 +7,10 @@ candidates without retaining the complete candidate object set in memory.
 """
 
 from dataclasses import dataclass
+import hashlib
 import math
 import time
-from typing import Callable, Dict, Iterable, Iterator, NamedTuple, Optional
+from typing import Callable, Dict, Iterable, Iterator, Mapping, NamedTuple, Optional
 
 import numpy as np
 
@@ -83,6 +84,9 @@ class CandidateGenerationContext:
     forecast_version: str
     forecast_covered_until_sim: Optional[float]
     earliest_compute_start_sim: float
+    candidate_mode: CandidateMode = CandidateMode.COMPLETE
+    selected_records: Optional[tuple] = None
+    selected_metrics: Optional[tuple] = None
 
 
 class CandidateRecord(NamedTuple):
@@ -127,7 +131,7 @@ class CompleteCandidateStream:
 
     @property
     def candidate_mode(self):
-        return CandidateMode.COMPLETE
+        return self.context.candidate_mode
 
     @property
     def earliest_compute_start_sim(self):
@@ -163,6 +167,10 @@ class CandidateGenerator:
         transmission_model: TransmissionModel,
         calendar: ReservationCalendar,
         time_tolerance: float = 1e-9,
+        candidate_mode: str = "complete",
+        pool_max_by_sla: Optional[Mapping[str, int]] = None,
+        pool_node_limit_by_sla: Optional[Mapping[str, int]] = None,
+        pool_time_samples_by_sla: Optional[Mapping[str, int]] = None,
     ):
         self.compute_nodes = tuple(str(node) for node in compute_nodes)
         if not self.compute_nodes:
@@ -174,7 +182,43 @@ class CandidateGenerator:
         self.transmission_model = transmission_model
         self.calendar = calendar
         self.time_tolerance = positive_finite("time_tolerance", time_tolerance)
+        try:
+            self.candidate_mode = CandidateMode(candidate_mode)
+        except ValueError as error:
+            raise ValueError(
+                "candidate_mode must be complete or layered_pool"
+            ) from error
+        if self.candidate_mode is CandidateMode.APPROXIMATE:
+            raise ValueError("approximate is not a runtime candidate mode")
+        defaults = {
+            "max": {"Hard": 128, "Soft": 256, "Flexible": 512},
+            "nodes": {"Hard": 8, "Soft": 12, "Flexible": 16},
+            "times": {"Hard": 16, "Soft": 24, "Flexible": 32},
+        }
+        self.pool_max_by_sla = self._pool_limits(
+            "pool_max_by_sla", pool_max_by_sla or defaults["max"]
+        )
+        self.pool_node_limit_by_sla = self._pool_limits(
+            "pool_node_limit_by_sla",
+            pool_node_limit_by_sla or defaults["nodes"],
+        )
+        self.pool_time_samples_by_sla = self._pool_limits(
+            "pool_time_samples_by_sla",
+            pool_time_samples_by_sla or defaults["times"],
+        )
         self.profiler = None
+
+    @staticmethod
+    def _pool_limits(name, values):
+        required = {item.value for item in SlaType}
+        if set(values) != required:
+            raise ValueError(f"{name} must define Hard, Soft, and Flexible")
+        result = {}
+        for key, value in values.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name}[{key}] must be a positive integer")
+            result[key] = value
+        return result
 
     def is_statically_serviceable(self, task: TaskSpec) -> bool:
         for target_node in self.compute_nodes:
@@ -354,6 +398,306 @@ class CandidateGenerator:
                 time.perf_counter() - item_started,
             )
         return result, None
+
+    def prepare_stream(self, *args, **kwargs):
+        if self.candidate_mode is CandidateMode.LAYERED_POOL:
+            return self.prepare_layered_pool_stream(*args, **kwargs)
+        return self.prepare_complete_stream(*args, **kwargs)
+
+    def _adaptive_ticks(self, task, first, last, count):
+        if first > last:
+            return ()
+        anchors = [first, first + 1, first + 2, first + 4, last]
+        if task.sla_type is not SlaType.HARD:
+            preferred = _grid_tick_floor(
+                task.absolute_preferred_start_sim,
+                self.scheduling_cycle_sim,
+                self.time_tolerance,
+            )
+            anchors.extend(
+                preferred + offset for offset in (-4, -2, -1, 0, 1, 2, 4)
+            )
+        if count > 1:
+            anchors.extend(
+                round(first + index * (last - first) / (count - 1))
+                for index in range(count)
+            )
+        ticks = []
+        seen = set()
+        for tick in anchors:
+            tick = max(first, min(last, int(tick)))
+            if tick not in seen:
+                seen.add(tick)
+                ticks.append(tick)
+            if len(ticks) == count:
+                break
+        return tuple(sorted(ticks))
+
+    def _record_at_tick(self, context, target_node, path, duration, tick):
+        compute_start = tick * self.scheduling_cycle_sim
+        item, _ = self._feasible_item(
+            context,
+            target_node,
+            path,
+            duration,
+            compute_start,
+        )
+        if item is None:
+            return None
+        record = CandidateRecord(
+            "",
+            target_node,
+            path,
+            item["transmission_start"],
+            compute_start,
+            item["compute_end"],
+            item["tardiness"],
+            item["tardiness_applicable"],
+            item["node_util"],
+            item["path_util"],
+            item["capacity_margin"],
+        )
+        return self.attach_context_candidate_id(context, record)
+
+    @staticmethod
+    def _round_robin_unique(rankings, limit):
+        selected = []
+        seen = set()
+        position = 0
+        while len(selected) < limit:
+            added = False
+            for ranking in rankings:
+                if position >= len(ranking):
+                    continue
+                value = ranking[position]
+                if value not in seen:
+                    seen.add(value)
+                    selected.append(value)
+                    added = True
+                    if len(selected) == limit:
+                        break
+            if not added and all(position + 1 >= len(item) for item in rankings):
+                break
+            position += 1
+        return tuple(selected)
+
+    @staticmethod
+    def _pareto_candidates(candidates):
+        def vector(item):
+            return (
+                item.estimated_candidate_marginal_system_cost_yuan,
+                -(
+                    item.estimated_green_coverage
+                    + item.estimated_green_absorption_delta
+                ),
+                item.compute_end_sim,
+                item.preferred_start_tardiness_ratio,
+                max(
+                    item.projected_node_utilization,
+                    item.projected_path_peak_utilization,
+                ),
+            )
+
+        items = tuple(candidates)
+        values = [vector(item) for item in items]
+        retained = []
+        for index, item in enumerate(items):
+            current = values[index]
+            dominated = any(
+                all(left <= right for left, right in zip(other, current))
+                and any(left < right for left, right in zip(other, current))
+                for other_index, other in enumerate(values)
+                if other_index != index
+            )
+            if not dominated:
+                retained.append(item)
+        return tuple(retained)
+
+    def _select_layered_pool(self, candidates, limit):
+        items = tuple(candidates)
+        if len(items) <= limit:
+            selected = items
+        else:
+            costs = [item.estimated_candidate_marginal_system_cost_yuan for item in items]
+            greens = [
+                item.estimated_green_coverage
+                + item.estimated_green_absorption_delta
+                for item in items
+            ]
+            loads = [
+                max(item.projected_node_utilization, item.projected_path_peak_utilization)
+                for item in items
+            ]
+
+            def normalized(values, index):
+                low, high = min(values), max(values)
+                return 0.0 if high <= low else (values[index] - low) / (high - low)
+
+            balanced = {
+                item.candidate_id: (
+                    normalized(costs, index)
+                    - normalized(greens, index)
+                    + item.preferred_start_tardiness_ratio
+                    + normalized(loads, index)
+                )
+                for index, item in enumerate(items)
+            }
+            stable = lambda item: (
+                item.compute_start_sim,
+                item.target_node,
+                item.path.path_id,
+                item.candidate_id,
+            )
+            layers = (
+                (0.20, lambda item: (item.compute_end_sim, *stable(item))),
+                (0.20, lambda item: (item.estimated_candidate_marginal_system_cost_yuan, *stable(item))),
+                (0.20, lambda item: (-(item.estimated_green_coverage + item.estimated_green_absorption_delta), *stable(item))),
+                (0.10, lambda item: (item.preferred_start_tardiness_ratio, *stable(item))),
+                (0.10, lambda item: (max(item.projected_node_utilization, item.projected_path_peak_utilization), *stable(item))),
+                (0.15, lambda item: (balanced[item.candidate_id], *stable(item))),
+                (0.05, lambda item: hashlib.sha256(item.candidate_id.encode("utf-8")).digest()),
+            )
+            selected_by_id = {}
+            for ratio, key in layers:
+                quota = max(1, int(round(limit * ratio)))
+                for item in sorted(items, key=key)[:quota]:
+                    selected_by_id[item.candidate_id] = item
+            for item in sorted(items, key=lambda value: (balanced[value.candidate_id], *stable(value))):
+                if len(selected_by_id) >= limit:
+                    break
+                selected_by_id[item.candidate_id] = item
+            selected = tuple(selected_by_id.values())
+        frontier = self._pareto_candidates(selected)
+        return frontier or (min(items, key=lambda item: item.compute_end_sim),)
+
+    def prepare_layered_pool_stream(
+        self,
+        task: TaskSpec,
+        decision_time_sim: float,
+        reservation_snapshot: Optional[ReservationSnapshot] = None,
+        forecast_version: str = "perfect-v1",
+        forecast_covered_until_sim: Optional[float] = None,
+        metric_evaluator: Optional[MetricEvaluator] = None,
+    ) -> CompleteCandidateStream:
+        decision_time = finite_number("decision_time_sim", decision_time_sim)
+        snapshot = reservation_snapshot or self.calendar.snapshot()
+        forecast_limit = (
+            None
+            if forecast_covered_until_sim is None
+            else finite_number("forecast_covered_until_sim", forecast_covered_until_sim)
+        )
+        context = CandidateGenerationContext(
+            task,
+            decision_time,
+            snapshot,
+            forecast_version,
+            forecast_limit,
+            decision_time,
+            CandidateMode.LAYERED_POOL,
+        )
+        if decision_time > task.absolute_latest_start_sim + self.time_tolerance:
+            return CompleteCandidateStream(
+                self, context, CandidateGenerationStatus.EXPIRED_BEFORE_DECISION,
+                0, 0, "decision time is after absolute latest start", metric_evaluator,
+            )
+
+        grids = list(self._declared_path_grids(task, decision_time))
+        theoretical_slots = sum(max(0, last - first + 1) for _, _, _, first, last in grids)
+        anchor_candidates = []
+        for target_node, path, duration, first, last in grids:
+            for tick in self._adaptive_ticks(task, first, last, 4):
+                record = self._record_at_tick(context, target_node, path, duration, tick)
+                if record is not None:
+                    anchor_candidates.append(
+                        self.materialize_context_candidate(context, record, metric_evaluator)
+                    )
+                    break
+        if not anchor_candidates:
+            return CompleteCandidateStream(
+                self, context, CandidateGenerationStatus.EMPTY_PHYSICAL,
+                theoretical_slots, 0, "bounded physical candidate pool is empty", metric_evaluator,
+            )
+
+        best_by_node = {}
+        for item in anchor_candidates:
+            previous = best_by_node.get(item.target_node)
+            if previous is None or item.compute_end_sim < previous.compute_end_sim:
+                best_by_node[item.target_node] = item
+        nodes = tuple(best_by_node)
+        node_limit = min(self.pool_node_limit_by_sla[task.sla_type.value], len(nodes))
+        rankings = (
+            sorted(nodes, key=lambda node: (best_by_node[node].compute_end_sim, node)),
+            sorted(nodes, key=lambda node: (best_by_node[node].estimated_candidate_marginal_system_cost_yuan, node)),
+            sorted(nodes, key=lambda node: (-(best_by_node[node].estimated_green_coverage + best_by_node[node].estimated_green_absorption_delta), node)),
+            sorted(nodes, key=lambda node: (-best_by_node[node].capacity_margin, node)),
+            sorted(nodes, key=lambda node: hashlib.sha256((task.task_id + "|" + node).encode("utf-8")).digest()),
+        )
+        selected_nodes = set(self._round_robin_unique(rankings, node_limit))
+        time_samples = self.pool_time_samples_by_sla[task.sla_type.value]
+        records_by_id = {}
+        for target_node, path, duration, first, last in grids:
+            if target_node not in selected_nodes:
+                continue
+            for tick in self._adaptive_ticks(task, first, last, time_samples):
+                record = self._record_at_tick(context, target_node, path, duration, tick)
+                if record is not None:
+                    records_by_id[record.candidate_id] = record
+        preliminary = tuple(
+            self.materialize_context_candidate(context, record, metric_evaluator)
+            for record in records_by_id.values()
+        )
+        if not preliminary:
+            return CompleteCandidateStream(
+                self, context, CandidateGenerationStatus.EMPTY_PHYSICAL,
+                theoretical_slots, 0, "SLA-adaptive candidate pool is empty", metric_evaluator,
+            )
+        selected = self._select_layered_pool(
+            preliminary,
+            self.pool_max_by_sla[task.sla_type.value],
+        )
+        selected_records = tuple(
+            sorted(
+                (records_by_id[item.candidate_id] for item in selected),
+                key=lambda item: (
+                    item.compute_start_sim,
+                    item.target_node,
+                    item.path.path_id,
+                    item.candidate_id,
+                ),
+            )
+        )
+        selected_by_id = {item.candidate_id: item for item in selected}
+        selected_metrics = tuple(
+            {
+                "system_cost_yuan": selected_by_id[record.candidate_id].estimated_candidate_marginal_system_cost_yuan,
+                "green_coverage": selected_by_id[record.candidate_id].estimated_green_coverage,
+                "marginal_green_energy_mwh": selected_by_id[record.candidate_id].estimated_candidate_marginal_green_energy_mwh,
+                "green_absorption_delta": selected_by_id[record.candidate_id].estimated_green_absorption_delta,
+                "green_opportunity": selected_by_id[record.candidate_id].estimated_green_opportunity,
+            }
+            for record in selected_records
+        )
+        earliest = selected_records[0].compute_start_sim
+        final_context = CandidateGenerationContext(
+            task,
+            decision_time,
+            snapshot,
+            forecast_version,
+            forecast_limit,
+            earliest,
+            CandidateMode.LAYERED_POOL,
+            selected_records,
+            selected_metrics,
+        )
+        return CompleteCandidateStream(
+            self,
+            final_context,
+            CandidateGenerationStatus.OK,
+            theoretical_slots,
+            len(selected_records),
+            "",
+            metric_evaluator,
+        )
 
     def prepare_complete_stream(
         self,
@@ -563,6 +907,14 @@ class CandidateGenerator:
         *,
         include_candidate_id=True,
     ):
+        if context.selected_records is not None:
+            for record in context.selected_records:
+                yield (
+                    record
+                    if include_candidate_id
+                    else record._replace(candidate_id="")
+                )
+            return
         task = context.task
         for target_node, path, duration, first, last in self._declared_path_grids(
             task, context.decision_time_sim
@@ -781,6 +1133,20 @@ class CandidateGenerator:
             or chunk_size <= 0
         ):
             raise ValueError("chunk_size must be a positive integer")
+
+        if context.selected_records is not None:
+            records = context.selected_records
+            selected = records[rng.randrange(len(records))]
+            earliest = min(
+                records,
+                key=lambda item: (
+                    item.compute_start_sim,
+                    item.target_node,
+                    item.path.path_id,
+                    item.candidate_id,
+                ),
+            )
+            return selected, earliest, len(records)
 
         task = context.task
         count = 0
@@ -1062,7 +1428,7 @@ class CandidateGenerator:
             compute_end=record.compute_end_sim,
             compute_start=record.compute_start_sim,
             forecast_version=context.forecast_version,
-            mode=CandidateMode.COMPLETE.value,
+            mode=context.candidate_mode.value,
             node=record.target_node,
             path=record.path.path_id,
             reservation_version=(
@@ -1102,7 +1468,7 @@ class CandidateGenerator:
         candidate = Candidate(
             candidate_id=record.candidate_id,
             candidate_schema_version=CANDIDATE_SCHEMA_VERSION,
-            candidate_mode=CandidateMode.COMPLETE,
+            candidate_mode=context.candidate_mode,
             task_id=task.task_id,
             decision_time_sim=context.decision_time_sim,
             reservation_snapshot_version=context.reservation_snapshot.reservation_version,
@@ -1165,6 +1531,12 @@ class CandidateGenerator:
         record,
         metric_evaluator=None,
     ):
+        cached = getattr(context, "selected_metrics", None)
+        records = getattr(context, "selected_records", None)
+        if cached is not None and records is not None and record.candidate_id:
+            for selected_record, metrics in zip(records, cached):
+                if selected_record.candidate_id == record.candidate_id:
+                    return metrics
         metric_started = time.perf_counter()
         metrics = (
             metric_evaluator(
@@ -1214,6 +1586,136 @@ class CandidateGenerator:
         array_encoder = getattr(
             feature_encoder, "encode_candidate_arrays", None
         )
+
+        if context.selected_records is not None:
+            cached_metrics = getattr(context, "selected_metrics", None)
+            cached_metrics_by_id = (
+                None
+                if cached_metrics is None
+                else {
+                    record.candidate_id: metrics
+                    for record, metrics in zip(
+                        context.selected_records, cached_metrics
+                    )
+                }
+            )
+            groups = {}
+            for record in context.selected_records:
+                groups.setdefault(
+                    (record.target_node, record.path.path_id), []
+                ).append(record)
+            for records in groups.values():
+                for offset in range(0, len(records), chunk_size):
+                    chunk = records[offset:offset + chunk_size]
+                    if batch_evaluator is None or array_encoder is None:
+                        if with_records:
+                            raise ValueError(
+                                "record-backed feature chunks require batch "
+                                "metric and array feature encoders"
+                            )
+                        yield tuple(
+                            feature_encoder.encode_record(
+                                context,
+                                record,
+                                self.evaluate_context_candidate_metrics(
+                                    context,
+                                    record,
+                                    metric_evaluator=metric_evaluator,
+                                ),
+                            )
+                            for record in chunk
+                        )
+                        continue
+                    starts = np.asarray(
+                        [item.compute_start_sim for item in chunk],
+                        dtype=np.float64,
+                    )
+                    ends = np.asarray(
+                        [item.compute_end_sim for item in chunk],
+                        dtype=np.float64,
+                    )
+                    transmission_starts = np.asarray(
+                        [item.transmission_start_sim for item in chunk],
+                        dtype=np.float64,
+                    )
+                    first = chunk[0]
+                    if cached_metrics_by_id is not None:
+                        rows = [
+                            cached_metrics_by_id[item.candidate_id]
+                            for item in chunk
+                        ]
+                        metrics = {
+                            key: np.asarray([row[key] for row in rows])
+                            for key in rows[0]
+                        }
+                    else:
+                        metric_started = time.perf_counter()
+                        metrics = batch_evaluator(
+                            task=context.task,
+                            path=first.path,
+                            target_node=first.target_node,
+                            compute_start_sim=starts,
+                            compute_end_sim=ends,
+                            reservation_snapshot=context.reservation_snapshot,
+                        )
+                        if self.profiler is not None:
+                            self.profiler.add(
+                                "candidate_metric_evaluation_seconds",
+                                time.perf_counter() - metric_started,
+                            )
+                            self.profiler.increment(
+                                "candidate_metric_evaluation_count", len(chunk)
+                            )
+                    tardiness = np.asarray(
+                        [item.preferred_start_tardiness_ratio for item in chunk],
+                        dtype=np.float64,
+                    )
+                    tardiness_applicable = np.asarray(
+                        [item.preferred_start_tardiness_applicable for item in chunk],
+                        dtype=np.bool_,
+                    )
+                    node_utilization = np.asarray(
+                        [item.projected_node_utilization for item in chunk],
+                        dtype=np.float64,
+                    )
+                    path_utilization = np.asarray(
+                        [item.projected_path_peak_utilization for item in chunk],
+                        dtype=np.float64,
+                    )
+                    capacity_margin = np.asarray(
+                        [item.capacity_margin for item in chunk],
+                        dtype=np.float64,
+                    )
+                    encoded = array_encoder(
+                        context,
+                        target_node=first.target_node,
+                        compute_start_sim=starts,
+                        compute_end_sim=ends,
+                        transmission_start_sim=transmission_starts,
+                        preferred_start_tardiness_ratio=tardiness,
+                        preferred_start_tardiness_applicable=tardiness_applicable,
+                        projected_node_utilization=node_utilization,
+                        projected_path_peak_utilization=path_utilization,
+                        capacity_margin=capacity_margin,
+                        metrics=metrics,
+                    )
+                    if with_records:
+                        yield CandidateFeatureRecordChunk(
+                            encoded,
+                            first.target_node,
+                            first.path,
+                            transmission_starts,
+                            starts,
+                            ends,
+                            tardiness,
+                            tardiness_applicable,
+                            node_utilization,
+                            path_utilization,
+                            capacity_margin,
+                        )
+                    else:
+                        yield encoded
+            return
 
         if batch_evaluator is not None and array_encoder is not None:
             task = context.task

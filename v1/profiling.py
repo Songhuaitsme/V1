@@ -7,6 +7,7 @@ PROFILE_DETAIL_KEYS = (
     "candidate_prepare_seconds",
     "candidate_stream_seconds",
     "replay_candidate_generation_seconds",
+    "transition_feature_cache_seconds",
     "candidate_feature_encoding_seconds",
     "selection_inference_seconds",
     "bootstrap_inference_seconds",
@@ -27,7 +28,7 @@ PROFILE_DETAIL_KEYS = (
     "candidate_sla_and_item_seconds",
 )
 
-PROFILE_NESTED_STAGE_KEYS = PROFILE_DETAIL_KEYS[:8]
+PROFILE_NESTED_STAGE_KEYS = PROFILE_DETAIL_KEYS[:9]
 
 
 class TrainingPerformanceProfiler:
@@ -73,6 +74,7 @@ class TrainingPerformanceProfiler:
                 self.timings["candidate_prepare_seconds"]
                 + self.timings["candidate_stream_seconds"]
                 + self.timings["replay_candidate_generation_seconds"]
+                + self.timings["transition_feature_cache_seconds"]
             ),
             "candidate_feature_encoding": self.timings[
                 "candidate_feature_encoding_seconds"

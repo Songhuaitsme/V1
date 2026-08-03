@@ -1,9 +1,4 @@
-"""Production-oriented v1.0 candidate-DQN training entry point.
-
-The complete candidate contract is preserved. Candidate objects and feature
-matrices are streamed in bounded chunks; a preflight gate prevents an
-accidental multi-billion-candidate run without explicit acknowledgement.
-"""
+"""Production-oriented v1.0 candidate-DQN training entry point."""
 
 import argparse
 import csv
@@ -42,6 +37,12 @@ def _positive_int(name, value):
     return value
 
 
+def _optional_positive_int(name, value):
+    if value is None:
+        return None
+    return _positive_int(name, value)
+
+
 def _resolve_device(device):
     if device == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,7 +67,10 @@ def _metadata(runtime):
 def _training_config_view(**overrides):
     names = (
         "REQUIREMENTS_VERSION", "ALGORITHM_VERSION", "CANDIDATE_MODE",
-        "SCHEDULING_CYCLE", "V1_CANDIDATE_PATH_K", "V1_GAMMA_PER_SECOND",
+        "V1_CANDIDATE_MODE", "SCHEDULING_CYCLE", "V1_CANDIDATE_PATH_K",
+        "V1_CANDIDATE_POOL_MAX_BY_SLA",
+        "V1_CANDIDATE_POOL_NODE_LIMIT_BY_SLA",
+        "V1_CANDIDATE_POOL_TIME_SAMPLES_BY_SLA", "V1_GAMMA_PER_SECOND",
         "V1_CANDIDATE_DQN_HIDDEN_DIM", "LEARNING_RATE", "MEMORY_CAPACITY",
         "EPSILON_START", "EPSILON_MIN", "EPSILON_DECAY",
         "V1_TARGET_UPDATE_INTERVAL", "V1_COST_REFERENCE_YUAN",
@@ -91,14 +95,15 @@ def _resume_config_compatible(saved, requested):
     if not isinstance(saved, dict) or not isinstance(requested, dict):
         return False
     performance_only = {"candidate_chunk_size"}
+    semantic_keys = set(saved) | set(requested) | {"bootstrap_candidate_limit"}
     saved_semantics = {
-        key: value
-        for key, value in saved.items()
+        key: saved.get(key)
+        for key in semantic_keys
         if key not in performance_only
     }
     requested_semantics = {
-        key: value
-        for key, value in requested.items()
+        key: requested.get(key)
+        for key in semantic_keys
         if key not in performance_only
     }
     return _canonical_hash(saved_semantics) == _canonical_hash(
@@ -152,6 +157,7 @@ class V1TrainingLoop:
         batch_size=None,
         min_replay_size=None,
         updates_per_transition=None,
+        bootstrap_candidate_limit=None,
         random_seed=0,
         profiler=None,
     ):
@@ -183,6 +189,9 @@ class V1TrainingLoop:
             config.V1_TRAIN_UPDATES_PER_TRANSITION
             if updates_per_transition is None else updates_per_transition,
         )
+        self.bootstrap_candidate_limit = _optional_positive_int(
+            "bootstrap_candidate_limit", bootstrap_candidate_limit
+        )
         self.replay_random = random.Random(random_seed + 7919)
         self.target = type(runtime.candidate_q_network)(
             runtime.candidate_q_network.global_state_dim,
@@ -195,6 +204,7 @@ class V1TrainingLoop:
             config.LEARNING_RATE,
             device=self.device,
             candidate_chunk_size=self.candidate_chunk_size,
+            bootstrap_candidate_limit=self.bootstrap_candidate_limit,
             next_candidate_provider=self._next_candidate_feature_chunks,
         )
         self.trainer.update_target()
@@ -229,11 +239,14 @@ class V1TrainingLoop:
         evaluator = self.runtime.accounting.candidate_metric_evaluator(
             context.reservation_snapshot
         )
+        chunk_size = self.candidate_chunk_size
+        if self.bootstrap_candidate_limit is not None:
+            chunk_size = min(chunk_size, self.bootstrap_candidate_limit)
         return self.runtime.scheduler.candidate_generator.feature_chunks_from_context(
             context,
             self.runtime.candidate_feature_encoder,
             metric_evaluator=evaluator,
-            chunk_size=self.candidate_chunk_size,
+            chunk_size=chunk_size,
         )
 
     def to_device(self, device):
@@ -255,6 +268,14 @@ class V1TrainingLoop:
         self.candidate_chunk_size = chunk_size
         self.policy.candidate_chunk_size = chunk_size
         self.trainer.candidate_chunk_size = chunk_size
+
+    def set_bootstrap_candidate_limit(self, bootstrap_candidate_limit):
+        limit = _optional_positive_int(
+            "bootstrap_candidate_limit", bootstrap_candidate_limit
+        )
+        self.bootstrap_candidate_limit = limit
+        self.trainer.bootstrap_candidate_limit = limit
+        self.trainer.clear_next_feature_cache()
 
     def process_cycle(self, result):
         violations = scan_scheduler_invariants(self.runtime.scheduler, result)
@@ -366,6 +387,31 @@ class V1TrainingLoop:
 
     def _close_pending(self, *, next_state, next_context, next_time, terminal):
         data = self.pending
+        cache_started = time.perf_counter()
+        if terminal:
+            cached_features = np.empty(
+                (0, self.runtime.candidate_feature_encoder.feature_dim),
+                dtype=np.float32,
+            )
+        else:
+            chunks = tuple(
+                np.asarray(chunk, dtype=np.float32)
+                for chunk in self._next_candidate_feature_chunks(next_context)
+                if len(chunk)
+            )
+            cached_features = (
+                np.concatenate(chunks, axis=0)
+                if chunks
+                else np.empty(
+                    (0, self.runtime.candidate_feature_encoder.feature_dim),
+                    dtype=np.float32,
+                )
+            )
+        if self.profiler is not None:
+            self.profiler.add(
+                "transition_feature_cache_seconds",
+                time.perf_counter() - cache_started,
+            )
         transition = self.reward_assembler.build_transition(
             global_state_before=data["state"],
             selected_candidate_id=data["candidate_id"],
@@ -373,10 +419,14 @@ class V1TrainingLoop:
             immediate_reward=data["immediate_reward"],
             global_state_after=next_state,
             next_candidate_features=(),
-            next_candidate_context=None if terminal else next_context,
+            next_candidate_context=None,
             decision_time_sim=data["record"].decision_time_sim,
             next_transition_time_sim=next_time,
             terminal=terminal,
+        )
+        transition = replace(
+            transition,
+            next_candidate_features=cached_features,
         )
         self.replay.add(transition)
         self.transition_count += 1
@@ -472,6 +522,7 @@ def _estimate_candidate_work(
     batch_size,
     min_replay_size,
     updates_per_transition,
+    bootstrap_candidate_limit=None,
 ):
     batch_size = _positive_int("batch_size", batch_size)
     min_replay_size = max(
@@ -489,13 +540,22 @@ def _estimate_candidate_work(
     replay_samples = update_count * batch_size
     selection_visits = 2 * int(total_slots)
     if transition_count:
-        # Each replay sample regenerates one complete next-candidate set.  The
-        # exact sampled contexts are random, so the trace mean is the honest
-        # pre-run expectation and max_slots gives a conservative upper bound.
-        bootstrap_expected = (
-            replay_samples * int(total_slots) + transition_count - 1
-        ) // transition_count
-        bootstrap_upper = replay_samples * int(max_slots)
+        if bootstrap_candidate_limit is None:
+            # Each replay sample regenerates one complete next-candidate set.
+            # The exact sampled contexts are random, so the trace mean is the
+            # honest pre-run expectation and max_slots gives a conservative
+            # upper bound.
+            bootstrap_expected = (
+                replay_samples * int(total_slots) + transition_count - 1
+            ) // transition_count
+            bootstrap_upper = replay_samples * int(max_slots)
+        else:
+            limit = _positive_int(
+                "bootstrap_candidate_limit", bootstrap_candidate_limit
+            )
+            mean_slots = (int(total_slots) + transition_count - 1) // transition_count
+            bootstrap_expected = replay_samples * min(limit, mean_slots)
+            bootstrap_upper = replay_samples * min(limit, int(max_slots))
     else:
         bootstrap_expected = 0
         bootstrap_upper = 0
@@ -510,6 +570,7 @@ def _estimate_candidate_work(
         "estimated_total_candidate_visits": (
             selection_visits + bootstrap_expected
         ),
+        "bootstrap_candidate_limit": bootstrap_candidate_limit,
     }
 
 
@@ -520,6 +581,7 @@ def preflight_training(
     batch_size=None,
     min_replay_size=None,
     updates_per_transition=None,
+    bootstrap_candidate_limit=None,
 ):
     if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
         raise ValueError("steps must be a non-negative integer")
@@ -535,13 +597,23 @@ def preflight_training(
     task_count = 0
     total_slots = 0
     max_slots = 0
+    declared_slots = 0
     sla_counts = {item.value: 0 for item in SlaType}
     for cycle in range(steps):
         current += config.SCHEDULING_CYCLE
         arrivals = _generate_arrivals(runtime, current, cycle, total_capacity)
         for task in arrivals:
-            slots = runtime.scheduler.candidate_generator.theoretical_slot_count(
+            theoretical = runtime.scheduler.candidate_generator.theoretical_slot_count(
                 task, current
+            )
+            declared_slots += theoretical
+            slots = (
+                min(
+                    theoretical,
+                    config.V1_CANDIDATE_POOL_MAX_BY_SLA[task.sla_type.value],
+                )
+                if config.V1_CANDIDATE_MODE == "layered_pool"
+                else theoretical
             )
             task_count += 1
             total_slots += slots
@@ -558,6 +630,9 @@ def preflight_training(
         config.V1_TRAIN_UPDATES_PER_TRANSITION
         if updates_per_transition is None else updates_per_transition
     )
+    bootstrap_candidate_limit = _optional_positive_int(
+        "bootstrap_candidate_limit", bootstrap_candidate_limit
+    )
     work = _estimate_candidate_work(
         task_count,
         total_slots,
@@ -565,6 +640,7 @@ def preflight_training(
         batch_size=batch_size,
         min_replay_size=min_replay_size,
         updates_per_transition=updates_per_transition,
+        bootstrap_candidate_limit=bootstrap_candidate_limit,
     )
     return {
         "steps": steps,
@@ -572,11 +648,13 @@ def preflight_training(
         "task_count": task_count,
         "sla_counts": sla_counts,
         "theoretical_candidate_slots": total_slots,
+        "declared_complete_candidate_slots": declared_slots,
         "max_candidate_slots_per_task": max_slots,
         "training_parameters": {
             "batch_size": batch_size,
             "min_replay_size": max(batch_size, min_replay_size),
             "updates_per_transition": updates_per_transition,
+            "bootstrap_candidate_limit": bootstrap_candidate_limit,
         },
         **work,
         "objective_calibration_ready": not (
@@ -649,6 +727,7 @@ def _load_checkpoint(path, *, device, seed, run_config, profiler=None):
     loop.trainer.next_candidate_provider = loop._next_candidate_feature_chunks
     loop.to_device(device)
     loop.set_candidate_chunk_size(run_config["candidate_chunk_size"])
+    loop.set_bootstrap_candidate_limit(run_config.get("bootstrap_candidate_limit"))
     loop.policy.audit_candidate_set_hash = False
     loop.profiler = profiler
     runtime.scheduler.profiler = profiler
@@ -683,6 +762,7 @@ def run_training(
     batch_size=None,
     min_replay_size=None,
     updates_per_transition=None,
+    bootstrap_candidate_limit=None,
     checkpoint_every=None,
     log_every=None,
     resume_path=None,
@@ -712,6 +792,9 @@ def run_training(
         config.V1_TRAIN_UPDATES_PER_TRANSITION
         if updates_per_transition is None else updates_per_transition,
     )
+    bootstrap_candidate_limit = _optional_positive_int(
+        "bootstrap_candidate_limit", bootstrap_candidate_limit
+    )
     checkpoint_every = _positive_int(
         "checkpoint_every",
         config.V1_CHECKPOINT_INTERVAL_CYCLES
@@ -733,6 +816,7 @@ def run_training(
         batch_size=batch_size,
         min_replay_size=max(batch_size, min_replay_size),
         updates_per_transition=updates,
+        bootstrap_candidate_limit=bootstrap_candidate_limit,
     )
 
     if run_preflight and resume_path is None:
@@ -742,6 +826,7 @@ def run_training(
             batch_size=batch_size,
             min_replay_size=min_replay_size,
             updates_per_transition=updates,
+            bootstrap_candidate_limit=bootstrap_candidate_limit,
         )
         unsafe = (
             report["theoretical_candidate_slots"]
@@ -801,6 +886,7 @@ def run_training(
             batch_size=batch_size,
             min_replay_size=min_replay_size,
             updates_per_transition=updates,
+            bootstrap_candidate_limit=bootstrap_candidate_limit,
             random_seed=seed,
             profiler=profiler,
         )
@@ -938,6 +1024,14 @@ def main():
     parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
     parser.add_argument("--min-replay-size", type=int, default=config.V1_REPLAY_MIN_SIZE)
     parser.add_argument("--updates-per-transition", type=int, default=config.V1_TRAIN_UPDATES_PER_TRANSITION)
+    parser.add_argument(
+        "--bootstrap-candidate-limit",
+        type=int,
+        help=(
+            "training-only cap on candidates scanned for each replay "
+            "bootstrap target; omitted keeps exact complete bootstrap"
+        ),
+    )
     parser.add_argument("--checkpoint-every", type=int, default=config.V1_CHECKPOINT_INTERVAL_CYCLES)
     parser.add_argument("--log-every", type=int, default=config.V1_LOG_INTERVAL_CYCLES)
     parser.add_argument("--allow-large-run", action="store_true")
@@ -961,6 +1055,7 @@ def main():
             batch_size=args.batch_size,
             min_replay_size=args.min_replay_size,
             updates_per_transition=args.updates_per_transition,
+            bootstrap_candidate_limit=args.bootstrap_candidate_limit,
         ), ensure_ascii=False, indent=2))
         return
     path = run_training(
@@ -972,6 +1067,7 @@ def main():
         batch_size=args.batch_size,
         min_replay_size=args.min_replay_size,
         updates_per_transition=args.updates_per_transition,
+        bootstrap_candidate_limit=args.bootstrap_candidate_limit,
         checkpoint_every=args.checkpoint_every,
         log_every=args.log_every,
         resume_path=args.resume,

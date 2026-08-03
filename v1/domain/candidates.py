@@ -21,6 +21,7 @@ def _canonical_json_string(value: str) -> str:
 class CandidateMode(str, Enum):
     COMPLETE = "complete"
     APPROXIMATE = "approximate"
+    LAYERED_POOL = "layered_pool"
 
 
 class CandidateGenerationStatus(str, Enum):

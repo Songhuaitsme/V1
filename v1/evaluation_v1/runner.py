@@ -319,7 +319,7 @@ class EvaluationRunner:
             metric_schema_version="1.0",
             aggregation_schema_version="1.0",
             seed=seed,
-            candidate_mode="complete",
+            candidate_mode=self.scheduler.candidate_generator.candidate_mode.value,
             arrival_cutoff_sim=cutoff,
             evaluation_start_sim=start,
             final_settlement_time_sim=final_time,

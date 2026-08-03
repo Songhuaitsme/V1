@@ -202,7 +202,7 @@ class V1Scheduler:
         while True:
             snapshot = self.calendar.snapshot()
             prepare_started = time.perf_counter()
-            result = self.candidate_generator.prepare_complete_stream(
+            result = self.candidate_generator.prepare_stream(
                 task,
                 now_sim,
                 reservation_snapshot=snapshot,
@@ -378,9 +378,11 @@ class V1Scheduler:
             task.arrival_time_sim,
             task.task_id,
         )
-        # Complete mode visits every declared node/path/grid slot before physical
-        # filtering; feasible_candidate_count is tracked separately.
-        enumerated_slots = result.theoretical_slot_count
+        enumerated_slots = (
+            result.theoretical_slot_count
+            if result.candidate_mode.value == "complete"
+            else result.feasible_candidate_count
+        )
         return SchedulingDecision(
             task_id,
             status,
