@@ -23,6 +23,11 @@ class TrainingPerformanceProfilerTest(unittest.TestCase):
         }
         requested = dict(saved, candidate_chunk_size=65536)
         self.assertTrue(_resume_config_compatible(saved, requested))
+        self.assertTrue(
+            _resume_config_compatible(
+                saved, dict(requested, bootstrap_candidate_limit=None)
+            )
+        )
         self.assertFalse(
             _resume_config_compatible(
                 saved, dict(requested, batch_size=2)
@@ -31,6 +36,11 @@ class TrainingPerformanceProfilerTest(unittest.TestCase):
         self.assertFalse(
             _resume_config_compatible(
                 saved, dict(requested, epsilon_decay=0.9)
+            )
+        )
+        self.assertFalse(
+            _resume_config_compatible(
+                saved, dict(requested, bootstrap_candidate_limit=8192)
             )
         )
 
@@ -53,6 +63,24 @@ class TrainingPerformanceProfilerTest(unittest.TestCase):
             estimate["estimated_bootstrap_candidate_visits_upper_bound"],
             5600,
         )
+
+    def test_preflight_work_estimate_applies_bootstrap_candidate_limit(self):
+        estimate = _estimate_candidate_work(
+            10,
+            1000,
+            200,
+            batch_size=4,
+            min_replay_size=4,
+            updates_per_transition=1,
+            bootstrap_candidate_limit=30,
+        )
+        self.assertEqual(estimate["estimated_replay_context_samples"], 28)
+        self.assertEqual(estimate["estimated_bootstrap_candidate_visits"], 840)
+        self.assertEqual(
+            estimate["estimated_bootstrap_candidate_visits_upper_bound"],
+            840,
+        )
+        self.assertEqual(estimate["estimated_total_candidate_visits"], 2840)
 
     def test_summary_aggregates_exclusive_sections(self):
         profiler = TrainingPerformanceProfiler()

@@ -116,6 +116,46 @@ class CandidateAndQueueTest(unittest.TestCase):
         self.assertEqual(stream.feasible_candidate_count, len(streamed))
         self.assertEqual(stream.theoretical_slot_count, materialized.theoretical_slot_count)
 
+    def test_layered_pool_is_sla_bounded_and_uses_pool_mode(self):
+        calendar = ReservationCalendar({"N": 100.0}, {("S", "N"): 100.0})
+        generator = CandidateGenerator(
+            ("N",),
+            1.0,
+            StaticPathProvider(self.graph, max_paths_per_target=1),
+            TransmissionModel(TimeConverter(1.0), 200000.0),
+            calendar,
+            candidate_mode="layered_pool",
+            pool_max_by_sla={"Hard": 5, "Soft": 5, "Flexible": 5},
+            pool_node_limit_by_sla={"Hard": 1, "Soft": 1, "Flexible": 1},
+            pool_time_samples_by_sla={"Hard": 12, "Soft": 12, "Flexible": 12},
+        )
+
+        metric_calls = []
+
+        def metrics(**values):
+            start = values["compute_start_sim"]
+            metric_calls.append(start)
+            return {
+                "system_cost_yuan": 100.0 - start,
+                "green_coverage": start / 20.0,
+                "marginal_green_energy_mwh": 0.0,
+                "green_absorption_delta": 0.0,
+                "green_opportunity": True,
+            }
+
+        stream = generator.prepare_stream(
+            self._task(latest=20.0), 0.0, metric_evaluator=metrics
+        )
+        calls_after_prepare = len(metric_calls)
+        candidates = tuple(stream.iter_candidates())
+        self.assertEqual(stream.candidate_mode, CandidateMode.LAYERED_POOL)
+        self.assertLessEqual(len(candidates), 5)
+        self.assertGreater(len(candidates), 1)
+        self.assertTrue(
+            all(item.candidate_mode is CandidateMode.LAYERED_POOL for item in candidates)
+        )
+        self.assertEqual(len(metric_calls), calls_after_prepare)
+
     def test_unallocated_fast_path_matches_general_feasibility_path(self):
         for sla in ("Hard", "Soft", "Flexible"):
             with self.subTest(sla=sla):

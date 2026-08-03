@@ -9,14 +9,30 @@ AGGREGATION_SCHEMA_VERSION = "1.0"
 
 # WP-1只建立v1.0领域基础；现有训练/候选入口仍是legacy诊断模式。
 SCHEDULER_ENGINE = "v1"
-CANDIDATE_MODE = "complete"
-
 # v1.0 scheduler settings are independent from the legacy runtime switches.
 # Complete enumeration is the frozen acceptance baseline; approximate search is
 # an explicitly separate experimental mode.
-V1_CANDIDATE_MODE = "complete"
+V1_CANDIDATE_MODE = "layered_pool"
+CANDIDATE_MODE = V1_CANDIDATE_MODE
 V1_CANDIDATE_PATH_K = 1
 V1_TIME_TOLERANCE = 1e-9
+# Bounded production candidate search. ``complete`` remains available as the
+# exact audit baseline. Pool sizes adapt to the task SLA.
+V1_CANDIDATE_POOL_MAX_BY_SLA = {
+    "Hard": 128,
+    "Soft": 256,
+    "Flexible": 512,
+}
+V1_CANDIDATE_POOL_NODE_LIMIT_BY_SLA = {
+    "Hard": 8,
+    "Soft": 12,
+    "Flexible": 16,
+}
+V1_CANDIDATE_POOL_TIME_SAMPLES_BY_SLA = {
+    "Hard": 16,
+    "Soft": 24,
+    "Flexible": 32,
+}
 MAX_COMMIT_ATTEMPTS_PER_DECISION = 3
 V1_DETERMINISTIC_POLICY = "earliest_feasible"
 V1_OBJECTIVE_COST_WEIGHT = 0.5

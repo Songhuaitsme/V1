@@ -113,6 +113,19 @@ class CandidateDqnV1Test(unittest.TestCase):
         assembler.buffer_event(TimestampedReward(3.0, 100.0, "later", "COMPLETED"))
         self.assertEqual(buffer.items()[0], transition)
 
+    def test_numpy_replay_features_serialize(self):
+        transition = replace(
+            self._transition(),
+            next_candidate_features=np.asarray(
+                ((8.0, 9.0), (10.0, 11.0)), dtype=np.float32
+            ),
+        )
+        restored = ReplayTransition.from_json(transition.to_json())
+        np.testing.assert_array_equal(
+            restored.next_candidate_features,
+            transition.next_candidate_features,
+        )
+
     def test_replay_random_batch_and_checkpoint_state(self):
         first = self._transition()
         second = replace(first, selected_candidate_id="candidate-b", reward=6.0)
@@ -151,7 +164,65 @@ class CandidateDqnV1Test(unittest.TestCase):
         )
         loss = trainer.train_batch((transition, transition))
         self.assertTrue(np.isfinite(loss))
-        self.assertEqual(calls, ["snapshot-context", "snapshot-context"])
+        self.assertEqual(calls, ["snapshot-context"])
+
+    def test_bootstrap_candidate_limit_stops_context_generation_early(self):
+        events = []
+
+        def provider(context):
+            events.append(("start", context))
+            yield ((8.0, 9.0), (10.0, 11.0))
+            events.append(("after-first", context))
+            yield ((12.0, 13.0),)
+
+        online = SharedCandidateQNetwork(2, 2, 4)
+        target = SharedCandidateQNetwork(2, 2, 4)
+        trainer = CandidateDQNTrainer(
+            online,
+            target,
+            1e-3,
+            candidate_chunk_size=2,
+            bootstrap_candidate_limit=1,
+            next_candidate_provider=provider,
+        )
+        trainer.update_target()
+        transition = replace(
+            self._transition(),
+            next_candidate_features=(),
+            next_candidate_context="limited-context",
+        )
+        loss = trainer.train_batch((transition,))
+        self.assertTrue(np.isfinite(loss))
+        self.assertEqual(events, [("start", "limited-context")])
+
+    def test_ragged_batch_bootstrap_matches_sequential_targets(self):
+        torch.manual_seed(13)
+        online = SharedCandidateQNetwork(2, 2, 4)
+        target = SharedCandidateQNetwork(2, 2, 4)
+        trainer = CandidateDQNTrainer(online, target, 1e-3)
+        trainer.update_target()
+        first = self._transition()
+        second = replace(
+            first,
+            reward=2.0,
+            gamma_elapsed=0.8,
+            global_state_after=(2.0, 3.0),
+            next_candidate_features=((1.0, 2.0),),
+        )
+        terminal = replace(first, reward=-1.0, terminal=True)
+        batch = (first, second, terminal)
+        expected = []
+        for item in batch:
+            bootstrap = trainer._double_dqn_bootstrap(item)
+            expected.append(
+                item.reward
+                if bootstrap is None
+                else item.reward + item.gamma_elapsed * bootstrap
+            )
+        actual = trainer._double_dqn_bootstrap_batch(batch)
+        np.testing.assert_allclose(
+            actual.detach().cpu().numpy(), expected, rtol=1e-6, atol=1e-6
+        )
 
     # DQN-008 plus actual policy return contract
     def test_candidate_policy_has_no_wait_or_reject_action(self):
