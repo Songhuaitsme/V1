@@ -92,15 +92,54 @@ class PricingManager:
         region_base_price = self.region_base_price_map.get(region, fallback_base_price)
         return region_base_price * tou_multiplier
 
-    def get_external_tariff_yuan_per_mwh(self, node_id: str, global_time: float) -> float:
+    def get_external_tariff_yuan_per_mwh(
+        self,
+        node_id: str,
+        global_time: float,
+        mode: str = None,
+    ) -> float:
         """v1.0 external tariff boundary; legacy 0.50~1.30 inputs are yuan/kWh."""
 
         if self.G is None or node_id not in self.G:
             raise ValueError(f"unknown pricing node: {node_id}")
-        yuan_per_kwh = self._fetch_realtime_electricity_price(
-            self.G.nodes[node_id],
-            global_time,
-        )
+        if mode is None:
+            yuan_per_kwh = self._fetch_realtime_electricity_price(
+                self.G.nodes[node_id], global_time
+            )
+        else:
+            valid = {
+                "fixed", "tou_uniform", "tou_region",
+                "green_subsidy", "carbon_tax", "full",
+            }
+            if mode not in valid:
+                raise ValueError(f"unknown v1 tariff mode: {mode}")
+            node_data = self.G.nodes[node_id]
+            base = getattr(
+                config, "UNIFORM_BASE_ELECTRICITY_PRICE_YUAN_PER_MW", 1.30
+            )
+            if mode == "tou_region":
+                region = node_data.get("region")
+                tier = int(node_data.get("tier", 2))
+                fallback = (
+                    getattr(config, "BASELINE_ELECTRICITY_PRICE_YUAN_PER_MW", 1.30)
+                    * getattr(
+                        config,
+                        "PRICE_TIER_MULTIPLIERS",
+                        {1: 0.85, 2: 1.0, 3: 1.2},
+                    ).get(tier, 1.0)
+                )
+                base = self.region_base_price_map.get(region, fallback)
+            if mode == "fixed":
+                multiplier = 1.0
+            else:
+                day_duration = getattr(
+                    config, "TRAFFIC_DAY_DURATION_IN_SIM", 86400
+                )
+                progress = (global_time % day_duration) / day_duration
+                multiplier = self._price_lut[
+                    int(progress * len(self._price_lut)) % len(self._price_lut)
+                ]
+            yuan_per_kwh = base * multiplier
         return TariffConverter.yuan_per_kwh_to_yuan_per_mwh(yuan_per_kwh)
 
     def get_green_supply_mw(self, node_id: str, global_time: float) -> float:
