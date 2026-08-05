@@ -1,5 +1,6 @@
 """Linear incremental CPU power and dimensionally correct energy billing."""
 
+import math
 from dataclasses import dataclass
 from bisect import bisect_right
 from collections import OrderedDict
@@ -667,13 +668,25 @@ class ExogenousEnergyAccounting:
                 attributed_green[item.reservation_id],
                 attributed_green[item.reservation_id] / energy,
             ))
-        total_cost = sum(record.task_attributed_cost_yuan for record in records)
-        total_green = sum(
+        total_cost = math.fsum(
+            record.task_attributed_cost_yuan for record in records
+        )
+        total_green = math.fsum(
             record.task_attributed_green_energy_mwh for record in records
         )
-        if abs(total_cost - sum(node_bills.values())) > 1e-9:
+        if not math.isclose(
+            total_cost,
+            math.fsum(node_bills.values()),
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        ):
             raise RuntimeError("task attributed cost does not conserve node bill")
-        if abs(total_green - sum(node_greens.values())) > 1e-9:
+        if not math.isclose(
+            total_green,
+            math.fsum(node_greens.values()),
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        ):
             raise RuntimeError("task attributed green energy is not conserved")
         if accounting_interval is None and items:
             accounting_interval = TimeInterval(

@@ -168,6 +168,7 @@ class CandidateGenerator:
         calendar: ReservationCalendar,
         time_tolerance: float = 1e-9,
         candidate_mode: str = "complete",
+        active_wait_enabled: bool = True,
         pool_max_by_sla: Optional[Mapping[str, int]] = None,
         pool_node_limit_by_sla: Optional[Mapping[str, int]] = None,
         pool_time_samples_by_sla: Optional[Mapping[str, int]] = None,
@@ -190,6 +191,9 @@ class CandidateGenerator:
             ) from error
         if self.candidate_mode is CandidateMode.APPROXIMATE:
             raise ValueError("approximate is not a runtime candidate mode")
+        if not isinstance(active_wait_enabled, bool):
+            raise ValueError("active_wait_enabled must be boolean")
+        self.active_wait_enabled = active_wait_enabled
         defaults = {
             "max": {"Hard": 128, "Soft": 256, "Flexible": 512},
             "nodes": {"Hard": 8, "Soft": 12, "Flexible": 16},
@@ -248,6 +252,8 @@ class CandidateGenerator:
                     self.scheduling_cycle_sim,
                     self.time_tolerance,
                 )
+                if not self.active_wait_enabled:
+                    last = first
                 yield target_node, path, duration, first, last
 
     def theoretical_slot_count(self, task, decision_time_sim):

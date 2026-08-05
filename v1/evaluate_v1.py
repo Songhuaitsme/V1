@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from shared import config
+from v1.ablation_settings import apply_ablation_variant, variant_names
 from v1.evaluation_v1 import EvaluationRunner
 from v1.learning import validate_checkpoint_metadata
 from v1.scheduler import ObjectiveConfig
@@ -85,7 +86,21 @@ def run_evaluation(
     candidate_chunk_size=None,
     soft_tardiness_weight=None,
     flexible_tardiness_weight=None,
+    ablation_variant=None,
 ):
+    if ablation_variant is not None:
+        with apply_ablation_variant(ablation_variant):
+            return run_evaluation(
+                policy,
+                cutoff,
+                seed,
+                safety_cap,
+                model_path,
+                device=device,
+                candidate_chunk_size=candidate_chunk_size,
+                soft_tardiness_weight=soft_tardiness_weight,
+                flexible_tardiness_weight=flexible_tardiness_weight,
+            )
     if (
         (soft_tardiness_weight is not None or flexible_tardiness_weight is not None)
         and policy != "equal_weight"
@@ -129,9 +144,16 @@ def run_evaluation(
             weights_only=False,
         )
         metadata = checkpoint.get("metadata", {})
+        architecture = "shared_candidate_q_v1"
+        if not config.V1_DQN_USE_GLOBAL_STATE or not config.V1_DQN_DOUBLE_DQN:
+            architecture += (
+                f":global={int(config.V1_DQN_USE_GLOBAL_STATE)}"
+                f":double={int(config.V1_DQN_DOUBLE_DQN)}"
+            )
         validate_checkpoint_metadata(
             metadata,
             runtime.candidate_feature_encoder.feature_schema_hash,
+            architecture,
         )
         runtime.candidate_q_network.load_state_dict(
             checkpoint["model_state_dict"]
@@ -182,7 +204,7 @@ def run_evaluation(
             "numpy": np.__version__,
             "torch": torch.__version__,
         }),
-        "tariff_mode": "exogenous_yuan_per_mwh",
+        "tariff_mode": config.V1_TARIFF_MODE,
         "gamma_per_second": config.V1_GAMMA_PER_SECOND,
     }
     runner = EvaluationRunner(
@@ -230,6 +252,9 @@ def main():
     parser.add_argument("--output", default="artifacts/v1/evaluation/report.json")
     parser.add_argument("--soft-tardiness-weight", type=float)
     parser.add_argument("--flexible-tardiness-weight", type=float)
+    parser.add_argument(
+        "--ablation-variant", choices=variant_names()
+    )
     args = parser.parse_args()
     report = run_evaluation(
         args.policy,
@@ -241,6 +266,7 @@ def main():
         candidate_chunk_size=args.candidate_chunk_size,
         soft_tardiness_weight=args.soft_tardiness_weight,
         flexible_tardiness_weight=args.flexible_tardiness_weight,
+        ablation_variant=args.ablation_variant,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

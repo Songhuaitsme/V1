@@ -141,7 +141,11 @@ class CandidateDqnMetadata:
         return "candidate-dqn-" + hashlib.sha256(payload).hexdigest()[:16]
 
 
-def validate_checkpoint_metadata(metadata, expected_feature_schema_hash: str):
+def validate_checkpoint_metadata(
+    metadata,
+    expected_feature_schema_hash: str,
+    expected_architecture: str = None,
+):
     required = {
         "model_schema_version",
         "candidate_schema_version",
@@ -159,6 +163,12 @@ def validate_checkpoint_metadata(metadata, expected_feature_schema_hash: str):
         raise ValueError("incompatible candidate_schema_version")
     if metadata["feature_schema_hash"] != expected_feature_schema_hash:
         raise ValueError("candidate feature schema hash mismatch")
+    if (
+        expected_architecture is not None
+        and metadata.get("architecture", "shared_candidate_q_v1")
+        != expected_architecture
+    ):
+        raise ValueError("candidate DQN architecture mismatch")
     gamma = finite_number("gamma_per_second", metadata["gamma_per_second"])
     if not 0.0 < gamma <= 1.0:
         raise ValueError("checkpoint gamma_per_second must be in (0,1]")
@@ -727,6 +737,7 @@ class CandidateDQNTrainer:
         candidate_chunk_size=4096,
         bootstrap_candidate_limit=None,
         next_candidate_provider: Optional[Callable[[object], Iterable]] = None,
+        double_dqn: bool = True,
     ):
         if (
             isinstance(candidate_chunk_size, bool)
@@ -750,6 +761,9 @@ class CandidateDQNTrainer:
             )
         self.bootstrap_candidate_limit = bootstrap_candidate_limit
         self.next_candidate_provider = next_candidate_provider
+        if not isinstance(double_dqn, bool):
+            raise ValueError("double_dqn must be boolean")
+        self.double_dqn = double_dqn
         self.optimizer = torch.optim.Adam(
             self.online.parameters(), lr=positive_finite("learning_rate", learning_rate)
         )
@@ -765,6 +779,8 @@ class CandidateDQNTrainer:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        if "double_dqn" not in self.__dict__:
+            self.double_dqn = True
         if "_next_feature_cache" not in self.__dict__:
             self._next_feature_cache = OrderedDict()
         if "_next_feature_cache_capacity" not in self.__dict__:
@@ -888,17 +904,21 @@ class CandidateDQNTrainer:
         self._synchronize_profile_device()
         inference_started = time.perf_counter()
         with torch.no_grad():
-            online_values = self.online.forward_ragged(
-                next_states, candidate_features, batch_indices
-            )
             target_candidates = self.target.forward_ragged(
                 next_states, candidate_features, batch_indices
+            )
+            selection_values = (
+                self.online.forward_ragged(
+                    next_states, candidate_features, batch_indices
+                )
+                if self.double_dqn else target_candidates
             )
             best_indices = []
             offset = 0
             for count in counts:
                 best_indices.append(
-                    offset + torch.argmax(online_values[offset:offset + count])
+                    offset
+                    + torch.argmax(selection_values[offset:offset + count])
                 )
                 offset += count
             bootstrap = target_candidates[torch.stack(best_indices)]
@@ -965,10 +985,13 @@ class CandidateDQNTrainer:
                 )
                 self._synchronize_profile_device()
                 inference_started = time.perf_counter()
-                online_values = self.online(next_state, chunk)[0]
                 target_values = self.target(next_state, chunk)[0]
-                index = int(torch.argmax(online_values).item())
-                value = float(online_values[index].item())
+                selection_values = (
+                    self.online(next_state, chunk)[0]
+                    if self.double_dqn else target_values
+                )
+                index = int(torch.argmax(selection_values).item())
+                value = float(selection_values[index].item())
                 self._synchronize_profile_device()
                 if self.profiler is not None:
                     self.profiler.add(

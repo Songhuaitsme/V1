@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from shared import config
+from v1.ablation_settings import apply_ablation_variant, variant_names
 from v1.audit_v1 import scan_scheduler_invariants
 from v1.domain.models import SlaType, TaskState
 from v1.learning import (
@@ -54,6 +55,12 @@ def _resolve_device(device):
 
 
 def _metadata(runtime):
+    architecture = "shared_candidate_q_v1"
+    if not config.V1_DQN_USE_GLOBAL_STATE or not config.V1_DQN_DOUBLE_DQN:
+        architecture += (
+            f":global={int(config.V1_DQN_USE_GLOBAL_STATE)}"
+            f":double={int(config.V1_DQN_DOUBLE_DQN)}"
+        )
     return CandidateDqnMetadata(
         "1.0",
         "1.0",
@@ -61,6 +68,7 @@ def _metadata(runtime):
         runtime.candidate_q_network.global_state_dim,
         runtime.candidate_q_network.candidate_feature_dim,
         config.V1_GAMMA_PER_SECOND,
+        architecture=architecture,
     )
 
 
@@ -78,6 +86,14 @@ def _training_config_view(**overrides):
         "V1_OBJECTIVE_COST_WEIGHT", "V1_OBJECTIVE_GREEN_WEIGHT",
         "V1_OBJECTIVE_BALANCE_WEIGHT", "V1_SOFT_TARDINESS_WEIGHT",
         "V1_FLEXIBLE_TARDINESS_WEIGHT",
+        "V1_ABLATION_VARIANT", "V1_ACTIVE_WAIT_ENABLED",
+        "V1_DISCOUNT_MODE", "V1_DECISION_GAMMA",
+        "V1_REWARD_ESTIMATE_ENABLED",
+        "V1_REWARD_REALIZATION_CORRECTION_ENABLED",
+        "V1_REWARD_TERMINAL_PENALTIES_ENABLED",
+        "V1_DISABLED_CANDIDATE_FEATURE_GROUPS",
+        "V1_DQN_USE_GLOBAL_STATE", "V1_DQN_DOUBLE_DQN",
+        "V1_TARIFF_MODE",
     )
     values = {name: getattr(config, name) for name in names}
     values.update(overrides)
@@ -94,8 +110,28 @@ def _canonical_hash(value):
 def _resume_config_compatible(saved, requested):
     if not isinstance(saved, dict) or not isinstance(requested, dict):
         return False
+    legacy_defaults = {
+        "V1_ABLATION_VARIANT": "reference",
+        "V1_ACTIVE_WAIT_ENABLED": True,
+        "V1_DISCOUNT_MODE": "physical_time",
+        "V1_DECISION_GAMMA": 0.95,
+        "V1_REWARD_ESTIMATE_ENABLED": True,
+        "V1_REWARD_REALIZATION_CORRECTION_ENABLED": True,
+        "V1_REWARD_TERMINAL_PENALTIES_ENABLED": True,
+        "V1_DISABLED_CANDIDATE_FEATURE_GROUPS": (),
+        "V1_DQN_USE_GLOBAL_STATE": True,
+        "V1_DQN_DOUBLE_DQN": True,
+        "V1_TARIFF_MODE": "tou_uniform",
+    }
+    if any(
+        key not in saved and requested.get(key) != value
+        for key, value in legacy_defaults.items()
+    ):
+        return False
     performance_only = {"candidate_chunk_size"}
-    semantic_keys = set(saved) | set(requested) | {"bootstrap_candidate_limit"}
+    # Older checkpoints do not contain semantic keys added in later versions.
+    # Validate every setting they did record without rejecting absent metadata.
+    semantic_keys = set(saved) | {"bootstrap_candidate_limit"}
     saved_semantics = {
         key: saved.get(key)
         for key in semantic_keys
@@ -206,11 +242,17 @@ class V1TrainingLoop:
             candidate_chunk_size=self.candidate_chunk_size,
             bootstrap_candidate_limit=self.bootstrap_candidate_limit,
             next_candidate_provider=self._next_candidate_feature_chunks,
+            double_dqn=config.V1_DQN_DOUBLE_DQN,
         )
         self.trainer.update_target()
         self.replay = CandidateReplayBuffer(config.MEMORY_CAPACITY)
         self.reward_assembler = RewardAssembler(
-            GammaClock(config.V1_GAMMA_PER_SECOND, runtime.time_converter)
+            GammaClock(
+                config.V1_GAMMA_PER_SECOND,
+                runtime.time_converter,
+                mode=config.V1_DISCOUNT_MODE,
+                decision_gamma=config.V1_DECISION_GAMMA,
+            )
         )
         self.objective = ObjectiveScorer(ObjectiveConfig(
             config.V1_COST_REFERENCE_YUAN,
@@ -287,7 +329,10 @@ class V1TrainingLoop:
         for event in result.domain_events:
             if event.event_type == "TASK_COMPLETED":
                 self._buffer_completion(event.task_id, event.event_time_sim)
-            elif event.event_type == "TASK_FAILED":
+            elif (
+                event.event_type == "TASK_FAILED"
+                and config.V1_REWARD_TERMINAL_PENALTIES_ENABLED
+            ):
                 self.reward_assembler.buffer_event(TimestampedReward(
                     event.event_time_sim,
                     config.V1_FAILURE_PENALTY,
@@ -295,7 +340,10 @@ class V1TrainingLoop:
                     event.event_type,
                 ))
         for transition in result.state_transitions:
-            if transition.new_state is TaskState.EXPIRED:
+            if (
+                transition.new_state is TaskState.EXPIRED
+                and config.V1_REWARD_TERMINAL_PENALTIES_ENABLED
+            ):
                 self.reward_assembler.buffer_event(TimestampedReward(
                     transition.event_time_sim,
                     config.V1_EXPIRATION_PENALTY,
@@ -329,7 +377,10 @@ class V1TrainingLoop:
                 "state": trace.global_state,
                 "candidate_id": candidate.candidate_id,
                 "features": trace.selected_candidate_features,
-                "immediate_reward": estimated_utility,
+                "immediate_reward": (
+                    estimated_utility
+                    if config.V1_REWARD_ESTIMATE_ENABLED else 0.0
+                ),
             }
             self.candidate_count += trace.candidate_count
             if trace.q_min is not None:
@@ -376,11 +427,17 @@ class V1TrainingLoop:
         realized_utility = self.objective.score(
             realized_candidate, task.sla_type
         ).total_score
-        correction = self.reward_assembler.realization_correction(
-            record,
-            realized_utility,
-            config.V1_COMPLETION_OUTCOME_REWARD,
-        )
+        if config.V1_REWARD_REALIZATION_CORRECTION_ENABLED:
+            correction = (
+                realized_utility
+                - (
+                    record.estimated_local_utility
+                    if config.V1_REWARD_ESTIMATE_ENABLED else 0.0
+                )
+                + config.V1_COMPLETION_OUTCOME_REWARD
+            )
+        else:
+            correction = config.V1_COMPLETION_OUTCOME_REWARD
         self.reward_assembler.buffer_event(TimestampedReward(
             event_time_sim, correction, record.decision_id, "TASK_COMPLETED"
         ))
@@ -718,9 +775,24 @@ def _load_checkpoint(path, *, device, seed, run_config, profiler=None):
         raise ValueError("resume training configuration mismatch")
     runtime = checkpoint["runtime"]
     loop = checkpoint["loop"]
+    generator = runtime.scheduler.candidate_generator
+    if not hasattr(generator, "active_wait_enabled"):
+        generator.active_wait_enabled = True
+    encoder = runtime.candidate_feature_encoder
+    if not hasattr(encoder, "disabled_feature_groups"):
+        if run_config.get("V1_DISABLED_CANDIDATE_FEATURE_GROUPS"):
+            raise ValueError(
+                "legacy checkpoint cannot enable disabled candidate feature groups"
+            )
+        encoder.disabled_feature_groups = ()
+        encoder._disabled_feature_indices = ()
+    clock = loop.reward_assembler.clock
+    if not hasattr(clock, "mode"):
+        clock.mode = "physical_time"
+        clock.decision_gamma = 0.95
     validate_checkpoint_metadata(
         checkpoint.get("metadata", {}),
-        runtime.candidate_feature_encoder.feature_schema_hash,
+        encoder.feature_schema_hash,
     )
     loop.runtime = runtime
     loop.policy = runtime.scheduler.policy
@@ -1039,6 +1111,9 @@ def main():
     parser.add_argument("--skip-preflight", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument(
+        "--ablation-variant", choices=variant_names()
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="record exclusive training-stage wall-clock timings",
@@ -1048,35 +1123,36 @@ def main():
         help="profiling JSON path (default: <model>.profile.json)",
     )
     args = parser.parse_args()
-    if args.preflight_only:
-        print(json.dumps(preflight_training(
+    with apply_ablation_variant(args.ablation_variant):
+        if args.preflight_only:
+            print(json.dumps(preflight_training(
+                args.steps,
+                args.seed,
+                batch_size=args.batch_size,
+                min_replay_size=args.min_replay_size,
+                updates_per_transition=args.updates_per_transition,
+                bootstrap_candidate_limit=args.bootstrap_candidate_limit,
+            ), ensure_ascii=False, indent=2))
+            return
+        path = run_training(
             args.steps,
             args.seed,
+            args.output,
+            device=args.device,
+            candidate_chunk_size=args.candidate_chunk_size,
             batch_size=args.batch_size,
             min_replay_size=args.min_replay_size,
             updates_per_transition=args.updates_per_transition,
             bootstrap_candidate_limit=args.bootstrap_candidate_limit,
-        ), ensure_ascii=False, indent=2))
-        return
-    path = run_training(
-        args.steps,
-        args.seed,
-        args.output,
-        device=args.device,
-        candidate_chunk_size=args.candidate_chunk_size,
-        batch_size=args.batch_size,
-        min_replay_size=args.min_replay_size,
-        updates_per_transition=args.updates_per_transition,
-        bootstrap_candidate_limit=args.bootstrap_candidate_limit,
-        checkpoint_every=args.checkpoint_every,
-        log_every=args.log_every,
-        resume_path=args.resume,
-        allow_large_run=args.allow_large_run,
-        allow_uncalibrated_objective=args.allow_uncalibrated_objective,
-        run_preflight=not args.skip_preflight,
-        profile=args.profile,
-        profile_output_path=args.profile_output,
-    )
+            checkpoint_every=args.checkpoint_every,
+            log_every=args.log_every,
+            resume_path=args.resume,
+            allow_large_run=args.allow_large_run,
+            allow_uncalibrated_objective=args.allow_uncalibrated_objective,
+            run_preflight=not args.skip_preflight,
+            profile=args.profile,
+            profile_output_path=args.profile_output,
+        )
     completed = {"status": "complete", "model": str(path)}
     if args.profile:
         completed["profile"] = str(

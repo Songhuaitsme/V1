@@ -83,7 +83,7 @@ class V1Runtime:
         else:
             task_values = [0.0] * 5
         queue_norm = max(1, config.MAX_QUEUE_LENGTH)
-        return np.asarray([
+        state = np.asarray([
             math.sin(phase),
             math.cos(phase),
             *sla_one_hot,
@@ -97,6 +97,9 @@ class V1Runtime:
             float(np.max(utilizations)) if utilizations else 0.0,
             float(np.std(utilizations, ddof=0)) if utilizations else 0.0,
         ], dtype=np.float32)
+        if not config.V1_DQN_USE_GLOBAL_STATE:
+            state.fill(0.0)
+        return state
 
 
 def _build_forecast_segments(start_sim, end_sim, step_sim, value_provider):
@@ -110,6 +113,26 @@ def _build_forecast_segments(start_sim, end_sim, step_sim, value_provider):
         ))
         cursor = right
     return tuple(segments)
+
+
+def _v1_node_bill_rate_model(
+    *, node, time_sim, total_task_power_mw,
+    tariff_yuan_per_mwh, green_power_mw,
+):
+    """Optional V1 subsidy/tax layer kept separate from exogenous tariff."""
+
+    mode = config.V1_TARIFF_MODE
+    power = max(0.0, float(total_task_power_mw))
+    if power <= 0.0:
+        return 0.0
+    multiplier = 1.0
+    if green_power_mw >= power and mode in {"green_subsidy", "full"}:
+        surplus = (green_power_mw - power) / max(green_power_mw, 1e-12)
+        multiplier = 1.0 - config.GREEN_SUBSIDY_RATE * surplus
+    elif green_power_mw < power and mode in {"carbon_tax", "full"}:
+        grey_ratio = 1.0 - max(0.0, green_power_mw) / power
+        multiplier = 1.0 + config.CARBON_TAX_RATE * grey_ratio
+    return tariff_yuan_per_mwh * power * multiplier
 
 
 def create_v1_runtime(
@@ -154,6 +177,7 @@ def create_v1_runtime(
         calendar,
         config.V1_TIME_TOLERANCE,
         candidate_mode=config.V1_CANDIDATE_MODE,
+        active_wait_enabled=config.V1_ACTIVE_WAIT_ENABLED,
         pool_max_by_sla=config.V1_CANDIDATE_POOL_MAX_BY_SLA,
         pool_node_limit_by_sla=config.V1_CANDIDATE_POOL_NODE_LIMIT_BY_SLA,
         pool_time_samples_by_sla=(
@@ -176,7 +200,7 @@ def create_v1_runtime(
                 step,
                 lambda time_sim, node=node: (
                     infrastructure.pricing_manager.get_external_tariff_yuan_per_mwh(
-                        node, time_sim
+                        node, time_sim, mode=config.V1_TARIFF_MODE
                     )
                 ),
             ),
@@ -198,6 +222,12 @@ def create_v1_runtime(
         LinearPowerModel(config.INCREMENTAL_CPU_POWER_MW_PER_CPU),
         tariff,
         green,
+        node_bill_rate_model=(
+            _v1_node_bill_rate_model
+            if config.V1_TARIFF_MODE
+            in {"green_subsidy", "carbon_tax", "full"}
+            else None
+        ),
     )
     ledger = MetricsLedger(accounting)
     task_manager = TaskManager(
@@ -238,6 +268,9 @@ def create_v1_runtime(
             absorption_delta_scale=config.V1_GREEN_ABSORPTION_DELTA_SCALE,
             cpu_scale=max(node_capacities.values()),
             bandwidth_scale_mbps=config.DEFAULT_LINK_BANDWIDTH,
+        ),
+        disabled_feature_groups=(
+            config.V1_DISABLED_CANDIDATE_FEATURE_GROUPS
         ),
     )
     runtime = V1Runtime(

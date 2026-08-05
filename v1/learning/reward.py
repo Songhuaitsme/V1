@@ -18,12 +18,27 @@ class DecisionRecord:
 
 
 class GammaClock:
-    def __init__(self, gamma_per_second: float, time_converter: TimeConverter):
+    def __init__(
+        self,
+        gamma_per_second: float,
+        time_converter: TimeConverter,
+        mode: str = "physical_time",
+        decision_gamma: float = 0.95,
+    ):
         gamma = finite_number("gamma_per_second", gamma_per_second)
         if not 0.0 < gamma <= 1.0:
             raise ValueError("gamma_per_second must be in (0,1]")
         self.gamma_per_second = gamma
         self.time_converter = time_converter
+        if mode not in {"physical_time", "decision_step", "none"}:
+            raise ValueError(
+                "discount mode must be physical_time, decision_step, or none"
+            )
+        decision = finite_number("decision_gamma", decision_gamma)
+        if not 0.0 < decision <= 1.0:
+            raise ValueError("decision_gamma must be in (0,1]")
+        self.mode = mode
+        self.decision_gamma = decision
 
     def elapsed_seconds(self, start_sim: float, end_sim: float) -> float:
         start = finite_number("start_sim", start_sim)
@@ -36,6 +51,10 @@ class GammaClock:
         seconds = finite_number("elapsed_seconds", elapsed_seconds)
         if seconds < 0.0:
             raise ValueError("elapsed_seconds cannot be negative")
+        if self.mode == "none":
+            return 1.0
+        if self.mode == "decision_step":
+            return self.decision_gamma
         return self.gamma_per_second ** seconds
 
 

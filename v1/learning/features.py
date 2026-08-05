@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import hashlib
 import json
-from typing import Mapping, Tuple
+from typing import Iterable, Mapping, Tuple
 
 import numpy as np
 
@@ -32,6 +32,27 @@ CANDIDATE_FEATURE_NAMES = (
     "bandwidth_demand_normalized",
 )
 
+CANDIDATE_FEATURE_GROUPS = {
+    "cost": ("marginal_cost_normalized",),
+    "green": (
+        "green_coverage",
+        "green_absorption_delta_normalized",
+        "green_opportunity",
+    ),
+    "sla": (
+        "start_delay_normalized",
+        "preferred_start_tardiness_ratio",
+        "preferred_start_tardiness_applicable",
+    ),
+    "load": (
+        "projected_node_utilization",
+        "projected_path_peak_utilization",
+        "capacity_margin",
+        "cpu_demand_normalized",
+        "bandwidth_demand_normalized",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class CandidateFeatureConfig:
@@ -47,7 +68,12 @@ class CandidateFeatureConfig:
 
 
 class CandidateFeatureEncoder:
-    def __init__(self, node_index: Mapping[str, int], config: CandidateFeatureConfig):
+    def __init__(
+        self,
+        node_index: Mapping[str, int],
+        config: CandidateFeatureConfig,
+        disabled_feature_groups: Iterable[str] = (),
+    ):
         if not node_index:
             raise ValueError("node_index cannot be empty")
         values = tuple(node_index.values())
@@ -57,6 +83,23 @@ class CandidateFeatureEncoder:
             raise ValueError("node indices must be unique")
         self.node_index = dict(node_index)
         self.config = config
+        groups = tuple(sorted(set(disabled_feature_groups)))
+        unknown = set(groups) - set(CANDIDATE_FEATURE_GROUPS)
+        if unknown:
+            raise ValueError(
+                f"unknown candidate feature groups: {sorted(unknown)}"
+            )
+        self.disabled_feature_groups = groups
+        disabled_names = {
+            name
+            for group in groups
+            for name in CANDIDATE_FEATURE_GROUPS[group]
+        }
+        self._disabled_feature_indices = tuple(
+            index
+            for index, name in enumerate(CANDIDATE_FEATURE_NAMES)
+            if name in disabled_names
+        )
 
     @property
     def feature_dim(self) -> int:
@@ -64,13 +107,31 @@ class CandidateFeatureEncoder:
 
     @property
     def feature_schema_hash(self) -> str:
-        payload = json.dumps({
+        schema = {
             "version": "1.0",
             "features": CANDIDATE_FEATURE_NAMES,
             "nodes": sorted(self.node_index.items()),
             "scales": self.config.__dict__,
-        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        }
+        if self.disabled_feature_groups:
+            schema["disabled_feature_groups"] = self.disabled_feature_groups
+        payload = json.dumps(
+            schema, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
+
+    def _mask_matrix(self, matrix):
+        if self._disabled_feature_indices:
+            matrix[:, self._disabled_feature_indices] = 0.0
+        return matrix
+
+    def _mask_values(self, values):
+        if not self._disabled_feature_indices:
+            return values
+        mutable = list(values)
+        for index in self._disabled_feature_indices:
+            mutable[index] = 0.0
+        return tuple(mutable)
 
     def encode(self, candidate: Candidate, earliest_compute_start_sim: float) -> Tuple[float, ...]:
         return self._encode_values(
@@ -257,7 +318,7 @@ class CandidateFeatureEncoder:
                 ),
             )
         )
-        return matrix.astype(np.float32, copy=False)
+        return self._mask_matrix(matrix).astype(np.float32, copy=False)
 
     def encode_candidate_arrays(
         self,
@@ -384,7 +445,7 @@ class CandidateFeatureEncoder:
                 ),
             )
         )
-        return matrix.astype(np.float32, copy=False)
+        return self._mask_matrix(matrix).astype(np.float32, copy=False)
 
     def _encode_values(
         self,
@@ -415,7 +476,7 @@ class CandidateFeatureEncoder:
         max_node = max(self.node_index.values())
         node_normalized = 0.0 if max_node == 0 else node / max_node
         transmission_duration = compute_start_sim - transmission_start_sim
-        return (
+        return self._mask_values((
             node_normalized,
             (compute_start_sim - decision_time_sim) / self.config.time_scale_sim,
             (compute_start_sim - earliest_compute_start_sim) / self.config.time_scale_sim,
@@ -434,4 +495,4 @@ class CandidateFeatureEncoder:
             1.0 if abs(compute_start_sim - earliest_compute_start_sim) <= 1e-12 else 0.0,
             cpu_demand / self.config.cpu_scale,
             bandwidth_demand_mbps / self.config.bandwidth_scale_mbps,
-        )
+        ))
