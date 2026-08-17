@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import networkx as nx
 
@@ -24,6 +25,7 @@ from v1.evaluation_v1 import (
     summarize_load,
     summarize_sla,
 )
+from v1.evaluate_v1 import run_evaluation
 from v1.domain.models import MetricValue
 from v1.scheduler.candidate_generator import CandidateGenerator
 from v1.scheduler.path_provider import StaticPathProvider
@@ -33,6 +35,23 @@ from v1.scheduler.v1_scheduler import V1Scheduler
 
 
 class EvaluationV1Test(unittest.TestCase):
+    def test_evaluation_ensures_forecast_coverage_for_generated_trace(self):
+        with patch(
+            "v1.evaluate_v1.ensure_v1_runtime_forecasts_for_tasks"
+        ) as ensure_forecasts:
+            report = run_evaluation(
+                "earliest_feasible",
+                0.0,
+                7,
+                100,
+            )
+
+        self.assertEqual(report.status, EvaluationStatus.VALID)
+        ensure_forecasts.assert_called_once()
+        runtime, trace = ensure_forecasts.call_args.args
+        self.assertIsNotNone(runtime)
+        self.assertEqual(trace, ())
+
     def _forecast(self, value, *, green=False):
         segment = ForecastSegment(TimeInterval(0.0, 1000.0), value)
         if green:

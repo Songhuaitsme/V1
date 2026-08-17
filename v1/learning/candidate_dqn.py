@@ -108,8 +108,8 @@ def double_dqn_target(
 ) -> float:
     reward_value = finite_number("reward", reward)
     gamma = finite_number("gamma_elapsed", gamma_elapsed)
-    if not 0.0 < gamma <= 1.0:
-        raise ValueError("gamma_elapsed must be in (0,1]")
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError("gamma_elapsed must be in [0,1]")
     if terminal:
         return reward_value
     online = np.asarray(online_next_q, dtype=float)

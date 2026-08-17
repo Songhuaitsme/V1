@@ -43,7 +43,10 @@ class ReplayTransition:
             object.__setattr__(self, name, finite_number(name, getattr(self, name)))
         if self.next_transition_time_sim < self.decision_time_sim:
             raise ValueError("transition time cannot move backwards")
-        if self.elapsed_seconds < 0.0 or not 0.0 < self.gamma_elapsed <= 1.0:
+        # A very long physical-time interval can legitimately underflow
+        # gamma**elapsed to exactly zero in IEEE-754 arithmetic.  Zero means
+        # that the bootstrap contribution is numerically negligible.
+        if self.elapsed_seconds < 0.0 or not 0.0 <= self.gamma_elapsed <= 1.0:
             raise ValueError("invalid elapsed time or discount")
         if (self.selected_candidate_id is None) != (self.selected_candidate_features is None):
             raise ValueError("candidate id and selected features must be both present or absent")

@@ -402,6 +402,7 @@ class ExogenousEnergyAccounting:
         target_node: str,
         reservation_snapshot: ReservationSnapshot,
         first_start_sim: float,
+        required_end_sim: Optional[float] = None,
     ) -> _CandidateIntegralIndex:
         tariff, green = self._forecasts(target_node)
         forecast_start = max(
@@ -413,9 +414,17 @@ class ExogenousEnergyAccounting:
             green.segments[-1].interval_sim.end_sim,
         )
         domain_start = max(forecast_start, first_start_sim)
+        requested_end = (
+            task.absolute_latest_start_sim + task.execution_duration_sim
+            if required_end_sim is None
+            else finite_number("required_end_sim", required_end_sim)
+        )
         domain_end = min(
             forecast_end,
-            task.absolute_latest_start_sim + task.execution_duration_sim,
+            max(
+                task.absolute_latest_start_sim + task.execution_duration_sim,
+                requested_end,
+            ),
         )
         key = (
             task,
@@ -459,8 +468,17 @@ class ExogenousEnergyAccounting:
                         target_node,
                         snapshot,
                         start,
+                        end,
                     )
                     indices[local_key] = index
+                if not index.covers(start, end):
+                    return self.evaluate_candidate(
+                        task=task,
+                        target_node=target_node,
+                        compute_start_sim=start,
+                        compute_end_sim=end,
+                        reservation_snapshot=snapshot,
+                    ).as_candidate_metrics()
                 values = index.integrate(start, end)
                 (
                     task_energy,
@@ -563,8 +581,26 @@ class ExogenousEnergyAccounting:
                     target_node,
                     snapshot,
                     float(np.min(starts)),
+                    float(np.max(ends)),
                 )
                 indices[local_key] = index
+            if not index.covers(
+                float(np.min(starts)), float(np.max(ends))
+            ):
+                rows = [
+                    self.evaluate_candidate(
+                        task=task,
+                        target_node=target_node,
+                        compute_start_sim=float(start),
+                        compute_end_sim=float(end),
+                        reservation_snapshot=snapshot,
+                    ).as_candidate_metrics()
+                    for start, end in zip(starts, ends)
+                ]
+                return {
+                    key: np.asarray([row[key] for row in rows])
+                    for key in rows[0]
+                }
             values = index.integrate_many(starts, ends)
             task_energy = values[:, 0]
             marginal_cost = values[:, 2]

@@ -178,6 +178,59 @@ class AccountingV1Test(unittest.TestCase):
             [row["green_opportunity"] for row in scalar],
         )
 
+    def test_integral_index_expands_to_requested_float_boundary(self):
+        accounting = self._accounting()
+        snapshot = ReservationCalendar({"N": 2.0}, {}).snapshot()
+        task = TaskSpec.create(
+            task_id="float-boundary-task",
+            arrival_time_sim=0.0,
+            source_node="N",
+            cpu_demand=1.0,
+            execution_duration_sim=1.0,
+            data_size_mb=0.0,
+            bandwidth_demand_mbps=1.0,
+            sla_type="Hard",
+            latest_start_limit_sim=1.0,
+        )
+        graph = nx.Graph()
+        graph.add_node("N")
+        path = build_path_spec(graph, ["N"])
+        start = 1.0 + 2e-12
+        end = start + task.execution_duration_sim
+        expected = accounting.evaluate_candidate(
+            task=task,
+            target_node="N",
+            compute_start_sim=start,
+            compute_end_sim=end,
+            reservation_snapshot=snapshot,
+        ).as_candidate_metrics()
+        evaluator = accounting.candidate_metric_evaluator(snapshot)
+
+        actual = evaluator(
+            task=task,
+            path=path,
+            target_node="N",
+            compute_start_sim=start,
+            compute_end_sim=end,
+            reservation_snapshot=snapshot,
+        )
+        batch = evaluator.evaluate_batch(
+            task=task,
+            path=path,
+            target_node="N",
+            compute_start_sim=np.asarray([start]),
+            compute_end_sim=np.asarray([end]),
+            reservation_snapshot=snapshot,
+        )
+
+        for key, value in expected.items():
+            if isinstance(value, bool):
+                self.assertEqual(actual[key], value)
+                self.assertEqual(bool(batch[key][0]), value)
+            else:
+                self.assertAlmostEqual(actual[key], value, places=10)
+                self.assertAlmostEqual(float(batch[key][0]), value, places=10)
+
     # COST-010 / COST-012
     def test_time_scaling_and_kwh_conversion_are_explicit(self):
         first = self._accounting(

@@ -6,15 +6,78 @@ import uuid
 
 import torch
 
+from v1.domain.models import SlaType, TaskSpec
 from v1.train_v1 import (
     TrainingPerformanceProfiler,
     _estimate_candidate_work,
     _resume_config_compatible,
+    _should_run_invariant_check,
     run_training,
+)
+from v1.v1_runtime import (
+    create_v1_runtime,
+    ensure_v1_runtime_forecasts_for_tasks,
+    extend_v1_runtime_forecasts,
+    v1_runtime_forecast_end,
 )
 
 
 class TrainingPerformanceProfilerTest(unittest.TestCase):
+    def test_task_driven_forecast_extension_covers_unbounded_duration(self):
+        runtime = create_v1_runtime(forecast_end_sim=4.0, random_seed=7)
+        task = TaskSpec.create(
+            task_id="long-flexible",
+            arrival_time_sim=1.0,
+            source_node=runtime.infrastructure.base_stations[0],
+            cpu_demand=1.0,
+            execution_duration_sim=100.0,
+            data_size_mb=1.0,
+            bandwidth_demand_mbps=1.0,
+            sla_type=SlaType.FLEXIBLE,
+            preferred_start_limit_sim=10.0,
+        )
+
+        covered_until = ensure_v1_runtime_forecasts_for_tasks(runtime, (task,))
+
+        required = (
+            task.absolute_latest_start_sim
+            + task.execution_duration_sim
+            + 2.0
+        )
+        self.assertGreaterEqual(covered_until, required)
+        self.assertEqual(covered_until, v1_runtime_forecast_end(runtime))
+
+    def test_resume_forecasts_are_extended_without_replacing_old_values(self):
+        runtime = create_v1_runtime(forecast_end_sim=4.0, random_seed=7)
+        node = runtime.infrastructure.compute_nodes[0]
+        old_tariff_segments = runtime.accounting.tariff_by_node[node].segments
+        old_green_segments = runtime.accounting.green_by_node[node].segments
+        runtime.accounting._candidate_index_cache["stale"] = object()
+
+        extended = extend_v1_runtime_forecasts(runtime, 8.0)
+
+        self.assertEqual(extended, len(runtime.infrastructure.compute_nodes))
+        self.assertEqual(
+            runtime.accounting.tariff_by_node[node].segments[:len(old_tariff_segments)],
+            old_tariff_segments,
+        )
+        self.assertEqual(
+            runtime.accounting.green_by_node[node].segments[:len(old_green_segments)],
+            old_green_segments,
+        )
+        self.assertEqual(
+            runtime.accounting.tariff_by_node[node].segments[-1].interval_sim.end_sim,
+            8.0,
+        )
+        self.assertEqual(
+            runtime.accounting.green_by_node[node].segments[-1].interval_sim.end_sim,
+            8.0,
+        )
+        runtime.accounting.tariff_by_node[node].value_at(7.5)
+        runtime.accounting.green_by_node[node].value_at(7.5)
+        self.assertFalse(runtime.accounting._candidate_index_cache)
+        self.assertIs(runtime.metrics_ledger.accounting, runtime.accounting)
+
     def test_resume_allows_only_candidate_chunk_size_to_change(self):
         saved = {
             "candidate_chunk_size": 4096,
@@ -43,6 +106,27 @@ class TrainingPerformanceProfilerTest(unittest.TestCase):
                 saved, dict(requested, bootstrap_candidate_limit=8192)
             )
         )
+
+    def test_resume_allows_invariant_interval_to_change(self):
+        saved = {
+            "candidate_chunk_size": 4096,
+            "invariant_check_every": 1,
+            "batch_size": 128,
+            "bootstrap_candidate_limit": None,
+        }
+        requested = dict(saved, invariant_check_every=500)
+        self.assertTrue(_resume_config_compatible(saved, requested))
+
+    def test_invariant_checks_run_periodically_and_before_checkpoints(self):
+        values = {
+            "invariant_check_every": 500,
+            "checkpoint_every": 5000,
+            "final_cycle": 600000,
+        }
+        self.assertFalse(_should_run_invariant_check(499, **values))
+        self.assertTrue(_should_run_invariant_check(500, **values))
+        self.assertTrue(_should_run_invariant_check(5000, **values))
+        self.assertTrue(_should_run_invariant_check(600000, **values))
 
     def test_preflight_work_estimate_includes_replay_regeneration(self):
         estimate = _estimate_candidate_work(

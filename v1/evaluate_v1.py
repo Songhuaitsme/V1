@@ -17,7 +17,10 @@ from v1.ablation_settings import apply_ablation_variant, variant_names
 from v1.evaluation_v1 import EvaluationRunner
 from v1.learning import validate_checkpoint_metadata
 from v1.scheduler import ObjectiveConfig
-from v1.v1_runtime import create_v1_runtime
+from v1.v1_runtime import (
+    create_v1_runtime,
+    ensure_v1_runtime_forecasts_for_tasks,
+)
 
 
 def _canonical_hash(value) -> str:
@@ -161,6 +164,11 @@ def run_evaluation(
         runtime.scheduler.policy.epsilon = 0.0
         model_hash = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
     trace = _generate_trace(runtime, cutoff, seed)
+    # The configured lookahead is only an initial allocation.  A generated
+    # task can legally start near the end of its SLA window and then execute
+    # beyond ``cutoff + V1_MAX_FORECAST_LOOKAHEAD_SIM``.  Extend both physical
+    # forecasts from the realized trace before any candidate is evaluated.
+    ensure_v1_runtime_forecasts_for_tasks(runtime, trace)
     graph_data = nx.node_link_data(runtime.infrastructure.topo_manager.graph)
     config_view = {
         name: getattr(config, name)

@@ -74,6 +74,9 @@ V1_REPLAY_MIN_SIZE = 128
 V1_TRAIN_UPDATES_PER_TRANSITION = 1
 V1_CHECKPOINT_INTERVAL_CYCLES = 10000
 V1_LOG_INTERVAL_CYCLES = 1000
+# Full invariant scans are intentionally periodic during long training runs;
+# scheduler admission and state-transition checks remain active every cycle.
+V1_INVARIANT_CHECK_INTERVAL_CYCLES = 500
 V1_PREFLIGHT_MAX_TOTAL_SLOTS = 1000000000
 V1_PREFLIGHT_MAX_SLOTS_PER_TASK = 20000000
 # Includes both the two-pass policy selection and expected replay bootstrap

@@ -29,7 +29,12 @@ from v1.learning import (
 )
 from v1.profiling import TrainingPerformanceProfiler
 from v1.scheduler import ObjectiveConfig, ObjectiveScorer
-from v1.v1_runtime import create_v1_runtime
+from v1.v1_runtime import (
+    create_v1_runtime,
+    ensure_v1_runtime_forecasts_for_tasks,
+    extend_v1_runtime_forecasts,
+    v1_runtime_forecast_end,
+)
 
 
 def _positive_int(name, value):
@@ -124,11 +129,11 @@ def _resume_config_compatible(saved, requested):
         "V1_TARIFF_MODE": "tou_uniform",
     }
     if any(
-        key not in saved and requested.get(key) != value
+        key not in saved and key in requested and requested.get(key) != value
         for key, value in legacy_defaults.items()
     ):
         return False
-    performance_only = {"candidate_chunk_size"}
+    performance_only = {"candidate_chunk_size", "invariant_check_every"}
     # Older checkpoints do not contain semantic keys added in later versions.
     # Validate every setting they did record without rejecting absent metadata.
     semantic_keys = set(saved) | {"bootstrap_candidate_limit"}
@@ -158,6 +163,29 @@ def _run_profiled_operation(profiler, counter_key, operation):
     profiler.add("environment_update_seconds", max(0.0, elapsed - nested_delta))
     profiler.increment(counter_key)
     return result
+
+
+def _assert_scheduler_invariants(scheduler, cycle_result=None):
+    violations = scan_scheduler_invariants(scheduler, cycle_result)
+    if violations:
+        detail = "; ".join(
+            f"{item.invariant_id}:{item.detail}" for item in violations
+        )
+        raise RuntimeError(f"v1.0 invariant gate failed: {detail}")
+
+
+def _should_run_invariant_check(
+    completed_cycle,
+    *,
+    invariant_check_every,
+    checkpoint_every,
+    final_cycle,
+):
+    return (
+        completed_cycle % invariant_check_every == 0
+        or completed_cycle % checkpoint_every == 0
+        or completed_cycle == final_cycle
+    )
 
 
 def _write_profile_outputs(profiler, total_wall_seconds, json_path):
@@ -319,13 +347,9 @@ class V1TrainingLoop:
         self.trainer.bootstrap_candidate_limit = limit
         self.trainer.clear_next_feature_cache()
 
-    def process_cycle(self, result):
-        violations = scan_scheduler_invariants(self.runtime.scheduler, result)
-        if violations:
-            detail = "; ".join(
-                f"{item.invariant_id}:{item.detail}" for item in violations
-            )
-            raise RuntimeError(f"v1.0 invariant gate failed: {detail}")
+    def process_cycle(self, result, *, check_invariants=True):
+        if check_invariants:
+            _assert_scheduler_invariants(self.runtime.scheduler, result)
         for event in result.domain_events:
             if event.event_type == "TASK_COMPLETED":
                 self._buffer_completion(event.task_id, event.event_time_sim)
@@ -524,6 +548,12 @@ def _settle(runtime, loop, current_time, safety_cap=1000000, profiler=None):
         TaskState.TRANSMITTING,
         TaskState.RUNNING,
     }
+    unsettled_tasks = (
+        runtime.scheduler.state_machine.task_spec(task_id)
+        for task_id in runtime.scheduler.state_machine.task_ids
+        if runtime.scheduler.state_machine.runtime(task_id).state in unresolved
+    )
+    forecast_end = ensure_v1_runtime_forecasts_for_tasks(runtime, unsettled_tasks)
     while any(
         runtime.scheduler.state_machine.runtime(task_id).state in unresolved
         for task_id in runtime.scheduler.state_machine.task_ids
@@ -547,12 +577,15 @@ def _settle(runtime, loop, current_time, safety_cap=1000000, profiler=None):
         result = _run_profiled_operation(
             profiler,
             "scheduler_cycle_count",
-            lambda: runtime.scheduler.run_cycle(current_time),
+            lambda: runtime.scheduler.run_cycle(
+                current_time,
+                forecast_covered_until_sim=forecast_end,
+            ),
         )
         _run_profiled_operation(
             profiler,
             "training_process_cycle_count",
-            lambda: loop.process_cycle(result),
+            lambda: loop.process_cycle(result, check_invariants=False),
         )
     return current_time
 
@@ -761,7 +794,15 @@ def _save_checkpoint(path, runtime, loop, *, cycle, current_time, seed, run_conf
     os.replace(temporary, path)
 
 
-def _load_checkpoint(path, *, device, seed, run_config, profiler=None):
+def _load_checkpoint(
+    path,
+    *,
+    device,
+    seed,
+    run_config,
+    forecast_end_sim=None,
+    profiler=None,
+):
     # RNG states are CPU ByteTensors even when the resumed model will run on
     # CUDA. Load the checkpoint on CPU first, then move model and optimizer
     # tensors through the explicit, tested device migration below.
@@ -775,6 +816,13 @@ def _load_checkpoint(path, *, device, seed, run_config, profiler=None):
         raise ValueError("resume training configuration mismatch")
     runtime = checkpoint["runtime"]
     loop = checkpoint["loop"]
+    if forecast_end_sim is not None:
+        extend_v1_runtime_forecasts(runtime, forecast_end_sim)
+    restored_tasks = (
+        runtime.scheduler.state_machine.task_spec(task_id)
+        for task_id in runtime.scheduler.state_machine.task_ids
+    )
+    ensure_v1_runtime_forecasts_for_tasks(runtime, restored_tasks)
     generator = runtime.scheduler.candidate_generator
     if not hasattr(generator, "active_wait_enabled"):
         generator.active_wait_enabled = True
@@ -811,6 +859,7 @@ def _load_checkpoint(path, *, device, seed, run_config, profiler=None):
     torch.set_rng_state(checkpoint["torch_random_state"])
     if device == "cuda" and checkpoint.get("torch_cuda_random_state") is not None:
         torch.cuda.set_rng_state_all(checkpoint["torch_cuda_random_state"])
+    _assert_scheduler_invariants(runtime.scheduler)
     return runtime, loop, int(checkpoint["cycle"]), float(checkpoint["current_time_sim"])
 
 
@@ -837,6 +886,7 @@ def run_training(
     bootstrap_candidate_limit=None,
     checkpoint_every=None,
     log_every=None,
+    invariant_check_every=None,
     resume_path=None,
     allow_large_run=False,
     allow_uncalibrated_objective=False,
@@ -875,6 +925,11 @@ def run_training(
     log_every = _positive_int(
         "log_every", config.V1_LOG_INTERVAL_CYCLES if log_every is None else log_every,
     )
+    invariant_check_every = _positive_int(
+        "invariant_check_every",
+        config.V1_INVARIANT_CHECK_INTERVAL_CYCLES
+        if invariant_check_every is None else invariant_check_every,
+    )
     output = Path(output_path)
     log_path = output.with_name(output.stem + ".training.csv")
     profiler = TrainingPerformanceProfiler() if profile else None
@@ -889,7 +944,9 @@ def run_training(
         min_replay_size=max(batch_size, min_replay_size),
         updates_per_transition=updates,
         bootstrap_candidate_limit=bootstrap_candidate_limit,
+        invariant_check_every=invariant_check_every,
     )
+    horizon = steps * config.SCHEDULING_CYCLE + config.V1_MAX_FORECAST_LOOKAHEAD_SIM
 
     if run_preflight and resume_path is None:
         report = preflight_training(
@@ -931,6 +988,7 @@ def run_training(
             device=device,
             seed=seed,
             run_config=run_config,
+            forecast_end_sim=horizon,
             profiler=profiler,
         )
         if start_cycle > steps:
@@ -941,7 +999,6 @@ def run_training(
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        horizon = steps * config.SCHEDULING_CYCLE + config.V1_MAX_FORECAST_LOOKAHEAD_SIM
         runtime = create_v1_runtime(
             policy_name="candidate_dqn",
             forecast_end_sim=horizon,
@@ -965,6 +1022,8 @@ def run_training(
         start_cycle = 0
         current = 0.0
 
+    forecast_end = v1_runtime_forecast_end(runtime)
+
     total_capacity = sum(
         runtime.calendar.node_capacity(node)
         for node in runtime.infrastructure.compute_nodes
@@ -975,18 +1034,32 @@ def run_training(
     interval_losses = len(loop.losses)
     for cycle in range(start_cycle, steps):
         current += config.SCHEDULING_CYCLE
+        completed_cycle = cycle + 1
         arrivals = _generate_arrivals(runtime, current, cycle, total_capacity)
+        if arrivals:
+            forecast_end = ensure_v1_runtime_forecasts_for_tasks(runtime, arrivals)
         result = _run_profiled_operation(
             profiler,
             "scheduler_cycle_count",
-            lambda: runtime.scheduler.run_cycle(current, arrivals=arrivals),
+            lambda: runtime.scheduler.run_cycle(
+                current,
+                arrivals=arrivals,
+                forecast_covered_until_sim=forecast_end,
+            ),
         )
         _run_profiled_operation(
             profiler,
             "training_process_cycle_count",
-            lambda: loop.process_cycle(result),
+            lambda: loop.process_cycle(
+                result,
+                check_invariants=_should_run_invariant_check(
+                    completed_cycle,
+                    invariant_check_every=invariant_check_every,
+                    checkpoint_every=checkpoint_every,
+                    final_cycle=steps,
+                ),
+            ),
         )
-        completed_cycle = cycle + 1
         if completed_cycle % log_every == 0 or completed_cycle == steps:
             wall = time.perf_counter() - interval_wall_start
             recent_losses = loop.losses[interval_losses:]
@@ -1039,6 +1112,7 @@ def run_training(
     # work and is only for producing the frozen model artifact; saving after
     # settlement would make a later resume silently continue from a different
     # time line.
+    _assert_scheduler_invariants(runtime.scheduler)
     checkpoint_started = time.perf_counter()
     _save_checkpoint(
         _checkpoint_path(output), runtime, loop,
@@ -1052,6 +1126,7 @@ def run_training(
         )
 
     current = _settle(runtime, loop, current, profiler=profiler)
+    _assert_scheduler_invariants(runtime.scheduler)
     _run_profiled_operation(
         profiler,
         "training_process_cycle_count",
@@ -1106,6 +1181,11 @@ def main():
     )
     parser.add_argument("--checkpoint-every", type=int, default=config.V1_CHECKPOINT_INTERVAL_CYCLES)
     parser.add_argument("--log-every", type=int, default=config.V1_LOG_INTERVAL_CYCLES)
+    parser.add_argument(
+        "--invariant-check-every",
+        type=int,
+        default=config.V1_INVARIANT_CHECK_INTERVAL_CYCLES,
+    )
     parser.add_argument("--allow-large-run", action="store_true")
     parser.add_argument("--allow-uncalibrated-objective", action="store_true")
     parser.add_argument("--skip-preflight", action="store_true")
@@ -1146,6 +1226,7 @@ def main():
             bootstrap_candidate_limit=args.bootstrap_candidate_limit,
             checkpoint_every=args.checkpoint_every,
             log_every=args.log_every,
+            invariant_check_every=args.invariant_check_every,
             resume_path=args.resume,
             allow_large_run=args.allow_large_run,
             allow_uncalibrated_objective=args.allow_uncalibrated_objective,

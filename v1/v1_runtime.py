@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 import math
-from typing import Optional
+from typing import Iterable, Optional
 
 import numpy as np
 
@@ -113,6 +113,114 @@ def _build_forecast_segments(start_sim, end_sim, step_sim, value_provider):
         ))
         cursor = right
     return tuple(segments)
+
+
+def extend_v1_runtime_forecasts(
+    runtime: V1Runtime,
+    forecast_end_sim: float,
+) -> int:
+    """Extend forecasts restored from a shorter training checkpoint in place."""
+
+    forecast_end = positive_finite("forecast_end_sim", forecast_end_sim)
+    step = positive_finite("V1_FORECAST_STEP_SIM", config.V1_FORECAST_STEP_SIM)
+    pricing = runtime.infrastructure.pricing_manager
+    tariff_by_node = dict(runtime.accounting.tariff_by_node)
+    green_by_node = dict(runtime.accounting.green_by_node)
+    extended_nodes = 0
+
+    for node in runtime.infrastructure.compute_nodes:
+        try:
+            tariff = tariff_by_node[node]
+            green = green_by_node[node]
+        except KeyError as exc:
+            raise ValueError(f"missing physical forecast for node {node}") from exc
+
+        tariff_end = tariff.segments[-1].interval_sim.end_sim
+        green_end = green.segments[-1].interval_sim.end_sim
+        node_extended = False
+        if tariff_end < forecast_end - 1e-12:
+            appended = _build_forecast_segments(
+                tariff_end,
+                forecast_end,
+                step,
+                lambda time_sim, node=node: (
+                    pricing.get_external_tariff_yuan_per_mwh(
+                        node, time_sim, mode=config.V1_TARIFF_MODE
+                    )
+                ),
+            )
+            tariff_by_node[node] = PiecewiseConstantForecast.tariff_yuan_per_mwh(
+                tariff.segments + appended,
+                version=tariff.version,
+            )
+            node_extended = True
+        if green_end < forecast_end - 1e-12:
+            appended = _build_forecast_segments(
+                green_end,
+                forecast_end,
+                step,
+                lambda time_sim, node=node: (
+                    pricing.get_green_supply_mw(node, time_sim)
+                ),
+            )
+            green_by_node[node] = PiecewiseConstantForecast.green_power_mw(
+                green.segments + appended,
+                version=green.version,
+            )
+            node_extended = True
+        if node_extended:
+            extended_nodes += 1
+
+    if extended_nodes:
+        runtime.accounting.tariff_by_node = tariff_by_node
+        runtime.accounting.green_by_node = green_by_node
+        runtime.accounting._candidate_index_cache.clear()
+    return extended_nodes
+
+
+def v1_runtime_forecast_end(runtime: V1Runtime) -> float:
+    """Return the common usable end of every tariff and green forecast."""
+
+    ends = []
+    for node in runtime.infrastructure.compute_nodes:
+        try:
+            tariff = runtime.accounting.tariff_by_node[node]
+            green = runtime.accounting.green_by_node[node]
+        except KeyError as exc:
+            raise ValueError(f"missing physical forecast for node {node}") from exc
+        ends.append(min(
+            tariff.segments[-1].interval_sim.end_sim,
+            green.segments[-1].interval_sim.end_sim,
+        ))
+    if not ends:
+        raise ValueError("runtime has no physical forecasts")
+    return min(ends)
+
+
+def ensure_v1_runtime_forecasts_for_tasks(
+    runtime: V1Runtime,
+    tasks: Iterable[TaskSpec],
+) -> float:
+    """Ensure forecasts cover every task's latest possible compute interval."""
+
+    current_end = v1_runtime_forecast_end(runtime)
+    required_end = current_end
+    safety_margin = positive_finite(
+        "V1_FORECAST_STEP_SIM", config.V1_FORECAST_STEP_SIM
+    )
+    for task in tasks:
+        if not isinstance(task, TaskSpec):
+            raise TypeError("forecast coverage tasks must be TaskSpec instances")
+        required_end = max(
+            required_end,
+            task.absolute_latest_start_sim
+            + task.execution_duration_sim
+            + safety_margin,
+        )
+    if required_end > current_end + 1e-12:
+        extend_v1_runtime_forecasts(runtime, required_end)
+        current_end = v1_runtime_forecast_end(runtime)
+    return current_end
 
 
 def _v1_node_bill_rate_model(

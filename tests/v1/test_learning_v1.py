@@ -85,6 +85,10 @@ class CandidateDqnV1Test(unittest.TestCase):
             double_dqn_target(2.0, True, 0.5, (100.0,), (100.0,)),
             2.0,
         )
+        self.assertEqual(
+            double_dqn_target(2.0, False, 0.0, (9.0,), (100.0,)),
+            2.0,
+        )
 
     def _transition(self):
         return ReplayTransition(
@@ -622,6 +626,24 @@ class CandidateDqnV1Test(unittest.TestCase):
                 GammaClock(invalid, TimeConverter(1.0))
         unit = GammaClock(1.0, TimeConverter(300.0))
         self.assertEqual(unit.discount(999999.0), 1.0)
+
+    def test_physical_time_discount_underflow_is_a_valid_zero(self):
+        assembler = RewardAssembler(GammaClock(0.999, TimeConverter(300.0)))
+
+        transition = assembler.build_transition(
+            global_state_before=(0.0,),
+            selected_candidate_id=None,
+            selected_candidate_features=None,
+            immediate_reward=1.0,
+            global_state_after=(1.0,),
+            next_candidate_features=(),
+            decision_time_sim=0.0,
+            next_transition_time_sim=5000.0,
+            terminal=True,
+        )
+
+        self.assertEqual(transition.gamma_elapsed, 0.0)
+        self.assertGreater(transition.elapsed_seconds, 0.0)
 
     def test_feature_schema_and_train_step_use_selected_candidate_features(self):
         config = CandidateFeatureConfig(10.0, 5.0, 1.0, 10.0, 100.0)
